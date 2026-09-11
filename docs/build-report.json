@@ -1,15 +1,15 @@
 {
   "source": {
-    "digest": "sha256:0b8726a58ab01df66a50ef79e593265022a8774cd5ec9a58908ee7fd456cd646"
+    "digest": "sha256:35f3e2a533c4eef582746262c47705230310f4f3541579e9ad4132af54f45ccb"
   },
-  "generatedBy": "bunko 0.5.0",
+  "generatedBy": "bunko 0.7.0",
   "builderMode": "bundle",
   "platform": {
     "architecture": "amd64",
     "os": "linux"
   },
   "base": "sha256:139827a1de8540962e7e1add6980a99ffaf1a7c9d31e26e3ba0c3d3cc07e7bf3",
-  "imageDigest": "sha256:47b684ab2a6b0314c4caac289f36f608f8453c48c90b99bcf19853f26cc09b61",
+  "imageDigest": "sha256:99c78583a7338284def653bf7e13d2bed1f7419f619137a4251caf799c9c99a1",
   "layers": {
     "total": 17,
     "totalBytesCompressed": 43373304,

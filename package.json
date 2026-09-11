@@ -10,7 +10,7 @@
     "start": "bun run src/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build:report": "rm -rf .oci .oci-report.json && bunx @sakajunquality/bunko@0.5.0 build . --push=false --oci-layout ./.oci --report ./.oci-report.json && bun run scripts/build-report.ts"
+    "build:report": "rm -rf .oci .oci-report.json && bunx @sakajunquality/bunko@0.7.0 build . --push=false --oci-layout ./.oci --report ./.oci-report.json && bun run scripts/build-report.ts"
   },
   "dependencies": {
     "hono": "^4.10.7"

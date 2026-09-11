@@ -4,6 +4,10 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  # publish.yml runs these checks against the tagged tree before it builds an
+  # image, which a tag push would otherwise skip: the `push` filter above is
+  # branches only.
+  workflow_call:
 
 permissions:
   contents: read

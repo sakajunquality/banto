@@ -670,7 +670,7 @@ locals {
 # It also expects `var.banto_image`, declared here so the excerpt is complete.
 variable "banto_image" {
   type        = string
-  description = "banto image, by digest — see \"How it is built\" for producing one"
+  description = "banto image, by digest — see \"The published image\" for pulling one, or \"Building the image\" for producing your own"
 }
 
 resource "google_service_account" "banto" {
@@ -925,6 +925,36 @@ lifecycle {
 Otherwise the next `terraform apply` will put the pool back to whatever the
 configuration says and fight banto for it.
 
+## The published image
+
+Every `v*` tag is built and published to the GitHub Container Registry by
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml), so deploying
+banto does not require building it:
+
+```sh
+docker pull ghcr.io/sakajunquality/banto:<release tag>
+# Digest: sha256:… — that line, as ghcr.io/sakajunquality/banto@sha256:…, is
+# what var.banto_image takes. The tag is how you find the digest, not what you
+# deploy.
+```
+
+Releases are listed on the repository's releases page; there is nothing to pull
+until the first one is tagged.
+
+Two tags per release and no more: the release tag, and `sha-<commit>` with the
+full commit the image was built from, so an image can always be traced back to
+the source without guessing. There is no `latest` — the Terraform above wants a
+digest, and a tag that follows the newest release is a way to deploy something
+nobody chose. The workflow prints the digest-pinned reference in its job summary,
+which is the shortest path from a release to `var.banto_image`.
+
+Neither of those two is a *moving* tag, in the sense that `latest` is one by
+design. That is a statement about what the workflow publishes, not a guarantee
+the registry enforces: GHCR tags are mutable, so force-moving a git tag and
+re-running would overwrite the image a tag resolves to. If you want the
+guarantee rather than the intent, deploy the digest — which is what
+`var.banto_image` takes, and why the summary prints it.
+
 ## Building the image
 
 banto is containerised with [bunko](https://github.com/sakajunquality/bunko) —
@@ -935,7 +965,7 @@ To build without publishing — a local OCI layout plus the report the numbers
 below come from:
 
 ```sh
-bunx @sakajunquality/bunko@0.5.0 build . --push=false --oci-layout ./.oci --report ./.oci-report.json
+bunx @sakajunquality/bunko@0.7.0 build . --push=false --oci-layout ./.oci --report ./.oci-report.json
 ```
 
 `bun run build:report` runs exactly that and then reduces the report to
@@ -949,7 +979,7 @@ name comes from `bunko.imageName` in `package.json`:
 
 ```sh
 gcloud auth configure-docker asia-northeast1-docker.pkg.dev
-bunx @sakajunquality/bunko@0.5.0 build . \
+bunx @sakajunquality/bunko@0.7.0 build . \
   --repo asia-northeast1-docker.pkg.dev/my-runners-prd/containers \
   --image-refs ./image-refs.txt
 
