@@ -1,0 +1,38 @@
+{
+  "name": "banto",
+  "version": "0.1.0",
+  "description": "Keeps a Cloud Run worker pool staffed with ephemeral GitHub Actions runners, driven by workflow_job webhooks.",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "scripts": {
+    "dev": "bun run --hot src/index.ts",
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build:report": "rm -rf .oci .oci-report.json && bunx @sakajunquality/bunko@0.5.0 build . --push=false --oci-layout ./.oci --report ./.oci-report.json && bun run scripts/build-report.ts"
+  },
+  "dependencies": {
+    "hono": "^4.10.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.6",
+    "typescript": "~5.9.2"
+  },
+  "packageManager": "bun@1.4.2",
+  "bunko": {
+    "entrypoint": "src/index.ts",
+    "imageName": "banto",
+    "deps": {
+      "strategy": "closure",
+      "undeclaredImports": "error"
+    },
+    "env": {
+      "NODE_ENV": "production",
+      "PORT": "8080"
+    },
+    "ports": [
+      8080
+    ]
+  }
+}
