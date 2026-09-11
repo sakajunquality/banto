@@ -1,0 +1,20 @@
+# Pinning actions by commit is only half of the practice: a pin that nothing
+# moves is a version frozen on the day it was written, including its
+# vulnerabilities. This is the other half. Dependabot rewrites the SHA and the
+# `# vX.Y.Z` comment together, so the pin stays readable.
+#
+# Actions only. Bun dependencies are not covered: there is exactly one runtime
+# dependency, it is bundled into the image, and `bun.lock` is checked against
+# `packageManager` on every run.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One pull request rather than four. These move for reasons unrelated to
+      # each other, but reviewing them together is cheaper than reviewing them
+      # apart, and CI tells the same story either way.
+      actions:
+        patterns: ["*"]

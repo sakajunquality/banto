@@ -26,7 +26,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # No step here runs an authenticated git command, and this job holds a
           # `packages: write` token. Keep it out of the local git config rather
@@ -39,10 +39,6 @@ jobs:
       # The first successful publish creates the package private, and GITHUB_TOKEN
       # cannot change that; making ghcr.io/sakajunquality/banto public is a
       # one-time manual step in the package settings.
-      #
-      # Pinned by commit, unlike `checkout` above: this is the one step in the
-      # repository that is handed a token, and a moved tag on it would be a
-      # credential handed to different code.
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
