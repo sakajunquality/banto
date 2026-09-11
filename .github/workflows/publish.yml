@@ -1,0 +1,93 @@
+name: publish
+
+# Tags only. The deployment section takes an image as a digest, and a tag is how
+# a reader finds a digest worth pinning — it names a version of banto rather than
+# a point in its history. Publishing every push to main would produce a stream of
+# images that nothing refers to and nobody deploys, and would still leave the
+# question of which one to run unanswered.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # ci.yml filters `push` on branches, so a tag push runs none of it. Calling it
+  # here checks the tree the image is built from, instead of assuming the commit
+  # was green while it was on a branch — a tag can be moved onto one that wasn't.
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # No step here runs an authenticated git command, and this job holds a
+          # `packages: write` token. Keep it out of the local git config rather
+          # than leaving it there for everything downstream.
+          persist-credentials: false
+
+      # bunko reads registry credentials from ~/.docker/config.json and never
+      # talks to a Docker daemon. Writing that file is the whole job of this step.
+      #
+      # The first successful publish creates the package private, and GITHUB_TOKEN
+      # cannot change that; making ghcr.io/sakajunquality/banto public is a
+      # one-time manual step in the package settings.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pinned to the commit v0.7.0 resolves to. bunko reads its CLI version from
+      # the Action ref when that ref looks like a version, and otherwise from the
+      # checkout the ref names — so a commit pin fixes the CLI too, not just the
+      # Action.
+      - uses: sakajunquality/bunko@58ad5f2527820727f4365a12bdb4553f74618e28 # v0.7.0
+        with:
+          # Same reason as ci.yml: keep in step with `packageManager`.
+          bun-version: 1.4.2
+
+      - id: build
+        uses: sakajunquality/bunko/build@58ad5f2527820727f4365a12bdb4553f74618e28 # v0.7.0
+        with:
+          # bunko appends `bunko.imageName` from package.json, so this publishes
+          # ghcr.io/sakajunquality/banto.
+          repo: ghcr.io/sakajunquality
+          push: true
+          # Cloud Run worker pools are x86_64. This is the Action's default too;
+          # it is written out because it is a fact about the deployment target,
+          # not a default we happen to have inherited.
+          platforms: linux/amd64
+          cache: github
+          # The release tag, and the full commit under `sha-`. Between them a
+          # reader can go from an image back to the source without guessing, and
+          # neither moves. No `latest`: var.banto_image wants a digest, and a tag
+          # that follows the newest release invites deploying something nobody
+          # chose.
+          tags: |
+            ${{ github.ref_name }}
+            sha-${{ github.sha }}
+
+      # bunko writes its own summary — phase timings, cache, layer sizes,
+      # publication. This adds the single line the deployment section asks for by
+      # name, so the reference can be copied without reading the build detail.
+      - name: Record the published reference
+        env:
+          REFERENCE: ${{ steps.build.outputs.reference }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### banto $GITHUB_REF_NAME
+
+          Digest-pinned reference, to pass as \`var.banto_image\`:
+
+          \`\`\`
+          $REFERENCE
+          \`\`\`
+          EOF
