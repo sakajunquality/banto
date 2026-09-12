@@ -91,10 +91,10 @@ safely put in a URL — makes the whole listing partial.
   that something was missing is not erased by a later page reporting fewer.
 
 A cross-check that was never configured is the one thing that is *not* missing
-evidence: with no `GITHUB_ORG` there is no runner list to read, and a pool can
-still be scaled down on the cooldown. A cross-check that was configured and
-failed blocks the lowering, because the runner it could not read might be the
-busy one.
+evidence: with no `runnerRepo` on the pool and no `GITHUB_ORG` for the
+deployment, there is no runner list to read, and a pool can still be scaled
+down on the cooldown. A cross-check that was configured and failed blocks the
+lowering, because the runner it could not read might be the busy one.
 
 ### Matching jobs to pools
 
@@ -182,17 +182,17 @@ configuration side:
 - **`min`** — banto never takes a pool below it, so a pipeline that cannot
   tolerate a killed job should keep its capacity there and pay for it around the
   clock.
-- **The org cross-check**, which is what actually shortens this window. Read
+- **The runner cross-check**, which is what actually shortens this window. Read
   the next point before relying on `cooldownSeconds` instead of it.
 - **A generous `cooldownSeconds`**, with a caveat worth stating plainly: the
   cooldown's clock only restarts on a pass where *every* instance was
   justified — demand at least matched the instance count, or a runner was seen
-  working. Without `GITHUB_ORG` there are no runner observations, so a pool
-  with three instances and one running job never refreshes its anchor, and the
-  cooldown can already have elapsed by the time that job finishes. Raising
-  `cooldownSeconds` does not change that. It delays a shrink that follows a
-  genuinely quiet period; it does not delay one that follows a period of excess
-  capacity.
+  working. Without `runnerRepo` on the pool or `GITHUB_ORG` for the deployment
+  there are no runner observations, so a pool with three instances and one
+  running job never refreshes its anchor, and the cooldown can already have
+  elapsed by the time that job finishes. Raising `cooldownSeconds` does not
+  change that. It delays a shrink that follows a genuinely quiet period; it
+  does not delay one that follows a period of excess capacity.
 - **Short jobs.** The exposure is proportional to how long a job runs: a
   four-minute job spends far less of its life eligible to be stopped than a
   forty-minute one.
@@ -223,12 +223,38 @@ have to be fetched before the pools queued behind one another, and would then
 age while they waited — which is the bug class this design exists to remove. The
 cost is one listing per pool per reconcile, and it is accounted for below.
 
+The same rule holds for the runner listing, including when several pools
+declare the same `runnerRepo`: each pool's pass still asks that endpoint on its
+own, for the identical reason — an answer fetched for one pool and handed to
+the next would be stale by the time the next pool's pass acts on it. Sharing
+a repository does not make its runners' state any less able to change between
+two pools' passes.
+
 ### The runner cross-check
 
-Each pass reads `GET /orgs/{org}/actions/runners` (set `GITHUB_ORG`; the App
-needs **Organization -> Self-hosted runners: read**). Runners are matched to
-pools by their labels with exactly the same selector logic as jobs. That one call
-answers two questions the job queue cannot:
+Each pass reads a runner listing and matches the rows to pools by their labels,
+exactly the same selector logic as jobs. Which endpoint depends on where that
+pool's runners register:
+
+- **`runnerRepo` set on the pool** — `GET /repos/{owner}/{repo}/actions/runners`.
+  Use this when the runner registration token was minted for a repository
+  rather than the org, which is a property of how the runner image registers,
+  not of banto. Getting this wrong looks like nothing at all: the org endpoint
+  answers with an empty list rather than an error, so a pool checked at the
+  wrong scope reads as "zero runners", indistinguishable from a genuinely dead
+  pool until you already suspect the endpoint.
+- **`runnerRepo` unset** — `GET /orgs/{org}/actions/runners` (set `GITHUB_ORG`),
+  as before. This is still the right default for an installation whose runners
+  register to the org.
+
+The App needs **Organization -> Self-hosted runners: read** for the org form,
+or **Administration: read** on the repository for the repo form. Note that the
+repo form is *not* covered by `Actions: read`: GitHub's own description of
+`GET /repos/{owner}/{repo}/actions/runners` is "authenticated users must have
+admin access to the repository", which for an App is the Administration
+permission. An App that mints runner registration tokens already holds the
+write version of it. That one call answers two questions
+the job queue cannot:
 
 - **Are the instances actually becoming runners?** banto compares each pool's
   instance count with the number of *online* runners carrying its labels. A brief
@@ -252,12 +278,16 @@ The observation is used by the pass that fetched it and is not kept afterwards.
 
 What happens when it is missing depends on *why*:
 
-- **`GITHUB_ORG` unset** — the cross-check is not configured, which is a
-  deployment choice rather than a gap. The pass falls back to the cooldown.
+- **Neither `runnerRepo` nor `GITHUB_ORG` is set** — the cross-check is not
+  configured, which is a deployment choice rather than a gap. The pass falls
+  back to the cooldown.
 - **The call failed, or the listing was truncated** — that is missing evidence.
   The pass may raise a count but not lower one, and it will keep refusing to
   lower for as long as the failures persist. A pool cannot shrink while banto
-  cannot see its runners.
+  cannot see its runners. This is also what an unsafe `runnerRepo` produces,
+  should one ever reach the client — config rejects the shape at startup, so
+  this is a defense that should never fire, not a documented way to disable
+  the check.
 
 ### What it costs, and the knobs that bound it
 
@@ -502,7 +532,7 @@ Those surface on first use.
 | `GH_APP_INSTALLATION_ID` | yes | — | Installation ID; events from other installations are rejected |
 | `GH_APP_PRIVATE_KEY` | yes | — | PEM private key; `\n` escapes are accepted |
 | `GITHUB_REPOS` | no | installation's repos | Comma-separated `owner/repo` list: reconcile scope *and* webhook allowlist |
-| `GITHUB_ORG` | no | — | Org whose runner registrations the reconcile cross-checks |
+| `GITHUB_ORG` | no | — | Org whose runner registrations the reconcile cross-checks, for pools without their own `runnerRepo` |
 | `BANTO_STORE` | no | `gcs` | `gcs`, `firestore` or `memory` |
 | `BANTO_GCS_BUCKET` | when `gcs` | — | Bucket holding one state object per pool |
 | `BANTO_GCS_PREFIX` | no | `banto/` | Object name prefix |
@@ -528,6 +558,7 @@ Each entry of `BANTO_POOLS`:
 | `warmSpare` | no | `0` | Idle instances kept *on top of* current demand |
 | `name` | no | `workerPool` | Logical name; also the storage key, so letters, digits, `.`, `-`, `_` only |
 | `cooldownSeconds` | no | `300` | Idle cooldown before a scale-down, when the runner list is unavailable |
+| `runnerRepo` | no | — | `owner/repo` this pool's runners register to; unset means "cross-check against `GITHUB_ORG`" |
 
 **A pool's address must mean exactly what it says.** The three components are
 interpolated into a Cloud Run resource path *and* compared between pools to
@@ -553,9 +584,22 @@ to guarantee capacity exists at all, `warmSpare` to keep a runner waiting. A
 warm spare is an instance billed continuously for doing nothing, which is the
 point of it and also its cost.
 
-Worked example, two pools on one installation: `runner-default` for small,
-frequent jobs such as Terraform plans, and `runner-build` for container image
-builds, which need more memory and run less often.
+**`runnerRepo`.** Set this to the `owner/repo` your runner image registers
+to, when that is a repository rather than the org — check the registration
+step in the image, or GitHub's own **Settings -> Actions -> Runners** page for
+the repository versus the org. It needs no `GITHUB_ORG` of its own: a
+repo-scoped pool's cross-check works whether or not the deployment has one,
+because the two are independent scopes read at independent endpoints. When
+both are set, `runnerRepo` wins for that pool only — other pools in the same
+`BANTO_POOLS` with no `runnerRepo` still cross-check against `GITHUB_ORG`
+exactly as before. Getting this backwards (org-scoped runners with a
+`runnerRepo` set, or vice versa) reads as the cross-check finding nothing: see
+[the runner cross-check](#the-runner-cross-check).
+
+Worked example, three pools on one installation: `runner-default` for small,
+frequent jobs such as Terraform plans; `runner-build` for container image
+builds, which need more memory and run less often; and `runner-mobile`, whose
+image registers to a single repository rather than the org.
 
 ```json
 [
@@ -579,6 +623,17 @@ builds, which need more memory and run less often.
     "min": 0,
     "max": 3,
     "cooldownSeconds": 600
+  },
+  {
+    "name": "mobile",
+    "project": "my-runners-prd",
+    "location": "asia-northeast1",
+    "workerPool": "gh-runner-mobile",
+    "labels": ["self-hosted", "runner-mobile"],
+    "min": 0,
+    "max": 3,
+    "cooldownSeconds": 600,
+    "runnerRepo": "my-org/mobile-app"
   }
 ]
 ```
@@ -623,10 +678,15 @@ webhook triggers a pass, and a pass asks GitHub what is queued. A webhook that
 matches a pool therefore needs working App credentials just as much as the
 scheduled reconcile does.
 
-The App needs **Actions: read** (and **Metadata: read**) to list runs and jobs,
-plus **Organization -> Self-hosted runners: read** for the runner cross-check.
-It does not need the *write* runner-administration permission the runner image
-itself uses to register.
+The App needs **Actions: read** (and **Metadata: read**) to list runs and jobs.
+The runner cross-check needs a second grant, and which one depends on the
+scope: **Administration: read** on the repository for a pool with `runnerRepo`
+set, or **Organization -> Self-hosted runners: read** for one that falls back
+to `GITHUB_ORG`. `Actions: read` is not enough for either — it covers runs and
+jobs, not runner registrations. A pool without
+`runnerRepo` needs the deployment to also have **Organization -> Self-hosted
+runners: read**, for the org-wide cross-check. Neither form needs the *write*
+runner-administration permission the runner image itself uses to register.
 
 ## Pointing a GitHub App at it
 
@@ -635,9 +695,12 @@ itself uses to register.
 2. Subscribe to the **Workflow job** event. That is the only event banto reads;
    anything else is acknowledged with a 202 and dropped.
 3. Under **Permissions**, give the App **Actions: read** so `/reconcile` can list
-   runs and jobs, and **Organization -> Self-hosted runners: read** so it can
-   cross-check the runner registrations (the App that mints runner registration
-   tokens already has the write version of that one; a separate App works too).
+   runs and jobs. The runner cross-check needs one more, depending on scope:
+   **Administration: read** on the repository for pools that set `runnerRepo`,
+   and **Organization -> Self-hosted runners: read** for pools that rely on
+   `GITHUB_ORG` (the App that mints runner registration tokens already has the
+   write version of that one; a
+   separate App works too).
 4. Install it on the org or the repositories whose jobs should drive scaling, and
    put that installation's id in `GH_APP_INSTALLATION_ID` — events from any other
    installation of the same App are rejected. If the installation covers more
@@ -1042,8 +1105,14 @@ before changing anything:
 - **A scale-down is still a bet.** See [the hazard](#the-scale-down-hazard):
   banto shortens the window, Cloud Run still picks the victim, and no runner-side
   trick changes that.
-- **The runner cross-check is org-scoped.** Repo-level runner registrations are
-  not read, so a repo-scoped installation falls back to the cooldown.
+- **A pool's runner scope is one repo or the org, not several repos.** Set
+  `runnerRepo` for a repository, leave it unset for `GITHUB_ORG`. A pool whose
+  runners are split across more than one repository (or split between a
+  repository and the org) has no single scope that sees all of them; the
+  cross-check would need to read several endpoints and merge the rows, which
+  nothing here does. Give such a pool a `runnerRepo` covering its primary
+  registration target and accept that the cross-check undercounts, or, better,
+  make its registration consistent.
 - **One GitHub App, one installation.** Pools spanning two orgs would need a
   second set of credentials; the config has room for it, the code does not.
 - **One instance.** banto is not horizontally scalable, by design (see
@@ -1078,8 +1147,8 @@ before changing anything:
   round, and permanently so: the idle cooldown restarts on any pass where
   demand is at least the instance count, so a pool sitting above `max` with
   more work queued than it has instances refreshes its own anchor forever and
-  is never cut back. Configure the org cross-check, or fix an over-provisioned
-  pool by hand.
+  is never cut back. Configure the runner cross-check, or fix an
+  over-provisioned pool by hand.
 - **Each query reads at most `BANTO_MAX_PAGES_PER_QUERY` pages (default 5).**
   That is 500 runners in the org, 500 repositories in the installation, or 500
   active runs in one status for one repository. Past it the listing is

@@ -309,6 +309,26 @@ function parsePools(raw: string | undefined, problems: string[]): PoolConfig[] {
     }
     if (record.max === undefined) problems.push(`${where}.max is required`);
 
+    // Optional: absent means "cross-check against GITHUB_ORG", unchanged from
+    // before this field existed. Present means this pool's runners register to
+    // a repository instead, and it gets exactly the validation GITHUB_REPOS
+    // entries get — the same predicate the client uses before putting a name in
+    // a URL, so a typo is a startup error rather than a silently empty runner
+    // listing discovered in production.
+    let runnerRepo: string | undefined;
+    if (record.runnerRepo !== undefined) {
+      if (typeof record.runnerRepo !== "string" || !record.runnerRepo.trim()) {
+        problems.push(`${where}.runnerRepo must be a non-empty string when present`);
+      } else {
+        runnerRepo = record.runnerRepo.trim();
+        if (!isSafeRepoName(runnerRepo)) {
+          problems.push(
+            `${where}.runnerRepo "${runnerRepo}" is not owner/repo (each part: letters, digits, dot, dash or underscore)`,
+          );
+        }
+      }
+    }
+
     const pool: PoolConfig = {
       name,
       project,
@@ -319,6 +339,7 @@ function parsePools(raw: string | undefined, problems: string[]): PoolConfig[] {
       max: num("max", 0),
       warmSpare: num("warmSpare", 0),
       cooldownSeconds: num("cooldownSeconds", DEFAULT_COOLDOWN_SECONDS),
+      ...(runnerRepo ? { runnerRepo } : {}),
     };
     if (pool.max < pool.min) problems.push(`${where}.max (${pool.max}) is below min (${pool.min})`);
     if (pool.warmSpare > pool.max) {

@@ -178,6 +178,43 @@ describe("runner cross-check", () => {
     expect(calls).toEqual([]);
   });
 
+  test("a repo argument asks the repo endpoint instead of the org", async () => {
+    // The production bug this client shipped with: pools that register their
+    // runners to a repository were cross-checked at `/orgs/{org}/actions/runners`
+    // regardless, which always returns none of them. Without a `repo` branch
+    // here this test asks `/orgs/example-org/actions/runners` and fails.
+    const { instance, calls } = runnerClient([
+      { id: 1, name: "r1", status: "online", busy: true, labels: [{ name: "self-hosted" }] },
+    ]);
+    const listing = await instance.observeRunners("example-org/repo-scoped");
+    expect(calls).toEqual(["/repos/example-org/repo-scoped/actions/runners"]);
+    expect(listing).toMatchObject({ configured: true, complete: true });
+    expect(listing.configured && listing.items).toEqual([
+      { id: 1, name: "r1", busy: true, status: "online", labels: ["self-hosted"] },
+    ]);
+  });
+
+  test("a repo argument is used even when an org is also configured", async () => {
+    // Precedence a real deployment relies on: GITHUB_ORG is deployment-wide,
+    // but a pool that declares its own runnerRepo must be checked there, not
+    // folded into the org-wide listing that the org's other pools still use.
+    const { instance, calls } = runnerClient([]);
+    await instance.observeRunners("example-org/repo-scoped");
+    expect(calls).toEqual(["/repos/example-org/repo-scoped/actions/runners"]);
+    expect(calls.some((path) => path.includes("/orgs/"))).toBe(false);
+  });
+
+  test("an unsafe repo is refused rather than requested, and blocks a lowering", async () => {
+    // Config validates a pool's runnerRepo at startup with the same predicate,
+    // so this is defense in depth. It must not read as "not configured" (which
+    // would let the cooldown alone protect the pool): the pool did declare a
+    // scope, so the safe failure is missing evidence, not a silent fallback.
+    const { instance, calls } = runnerClient([]);
+    const listing = await instance.observeRunners("../evil");
+    expect(calls).toEqual([]);
+    expect(listing).toEqual({ configured: true, items: [], complete: false });
+  });
+
   test("a job status banto does not recognise makes the listing partial", async () => {
     // Reading an unknown status as "finished, not interesting" is the
     // dangerous default: a status GitHub adds later that means the job is

@@ -102,33 +102,43 @@ Honest list. These need other kinds of test, or have none.
    classified listings, so the rules deciding whether a real response is
    complete — missing fields, `total_count` disagreements, unusable repository
    names — are covered by `listing-fuzz.test.ts` instead.
-3. **Most of the client/controller boundary.** The Cloud Run fake now enforces
+3. **Which scope the runner cross-check asks.** `WorldGitHub.observeRunners`
+   ignores the `repo` argument and always answers from one shared, always-
+   configured runner list, so the model cannot distinguish a pool checked at
+   its own `runnerRepo` from one checked at the wrong scope entirely — the
+   exact mistake the org-only client shipped with. That distinction is covered
+   directly: `github.test.ts` asserts the endpoint a `repo` argument reaches
+   and that it wins over a configured org, and `controller.test.ts` reproduces
+   the production symptom (a busy runner invisible at the org, visible and
+   blocking at the pool's own repo; a permanent false staffing alarm from
+   asking the wrong endpoint) end to end through the real `GitHubAppClient`.
+4. **Most of the client/controller boundary.** The Cloud Run fake now enforces
    the etag precondition and models an external writer, but it still returns
    instantly, never fails a read, never returns a long-running Operation that
    later reports failure, and never rejects an update for any other reason. A
    regression in how the client parses a response, retries, or reads
    `scaling.manualInstanceCount` would be caught by `cloudrun.test.ts`, not here.
-4. **Two pools sharing one worker pool.** Configuration rejects it, so the model
+5. **Two pools sharing one worker pool.** Configuration rejects it, so the model
    cannot construct it; the rejection is covered in `config.test.ts`.
-5. **Real concurrency.** Interleavings come from a deterministic PRNG deciding
+6. **Real concurrency.** Interleavings come from a deterministic PRNG deciding
    how many microtasks each fake call takes. That explores orderings, not
    parallelism, and it cannot reach anything that depends on real timers, real
    sockets, or two processes.
-6. **A pool above its own `max`.** The model's external writer is capped at
+7. **A pool above its own `max`.** The model's external writer is capped at
    `max`, so it never manufactures this state and the property layer says
    nothing about it. The behaviour is asserted directly in `controller.test.ts`
    instead: the pool is cut back to `max` once nothing is in progress and the
    runners are idle, and is held above `max` only while a job is running or
    while runner evidence is missing and the cooldown has yet to elapse.
-7. **The scale-down hazard itself.** A runner picking up a job between the
+8. **The scale-down hazard itself.** A runner picking up a job between the
    observation and the PATCH is not a bug the model can distinguish from correct
    behaviour, because it is not a bug — it is the documented limitation. The
    invariants are written to tolerate it, which means they also cannot detect a
    change that made the window *wider*.
-8. **Rate-limit exhaustion and its knock-on effects.** Failures are injected as
+9. **Rate-limit exhaustion and its knock-on effects.** Failures are injected as
    independent per-call probabilities; a real exhaustion is correlated across
    every call for an hour, and nothing here models that.
-9. **Store semantics beyond compare-and-set.** The model's store is the
-   in-memory one wrapped in failures. Firestore and GCS behaviours — a
-   precondition rejected for a reason other than a conflict, a generation that
-   does not advance — are covered only by their own unit tests.
+10. **Store semantics beyond compare-and-set.** The model's store is the
+    in-memory one wrapped in failures. Firestore and GCS behaviours — a
+    precondition rejected for a reason other than a conflict, a generation that
+    does not advance — are covered only by their own unit tests.

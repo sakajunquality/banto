@@ -62,8 +62,17 @@ export class FakeWorkerPools implements WorkerPoolClient {
 export class FakeGitHub implements GitHubClient {
   calls = 0;
   runnerCalls = 0;
-  /** null stands for "the runner list was not available". */
+  /** The `repo` argument of every `observeRunners` call, in call order. */
+  runnerScopes: (string | undefined)[] = [];
+  /** null stands for "the runner list was not available" for the org-wide scope. */
   runners: ObservedRunner[] | null = null;
+  /**
+   * Runners returned for a repo-scoped call, keyed by `owner/repo`. A repo
+   * asked for but absent here returns an empty (but configured) listing —
+   * standing in for a real repo-scoped endpoint that has never heard of a
+   * runner, not for "unavailable".
+   */
+  runnersByRepo: Record<string, ObservedRunner[]> = {};
   runnerError: Error | null = null;
   jobsComplete = true;
   runnersComplete = true;
@@ -84,9 +93,13 @@ export class FakeGitHub implements GitHubClient {
     return { items: this.jobs, complete: this.jobsComplete };
   }
 
-  async observeRunners(): Promise<RunnerListing> {
+  async observeRunners(repo?: string): Promise<RunnerListing> {
     this.runnerCalls++;
+    this.runnerScopes.push(repo);
     if (this.runnerError) throw this.runnerError;
+    if (repo !== undefined) {
+      return { configured: true, items: this.runnersByRepo[repo] ?? [], complete: this.runnersComplete };
+    }
     // null stands for "no GITHUB_ORG configured", which is not a gap.
     if (this.runners === null) return { configured: false };
     return { configured: true, items: this.runners, complete: this.runnersComplete };

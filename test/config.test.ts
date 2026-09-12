@@ -224,6 +224,38 @@ describe("warm spare and pass interval", () => {
     expect(loadConfig({ ...BASE, GITHUB_ORG: "example-org" }).github.org).toBe("example-org");
     expect(loadConfig(BASE).github.org).toBe("");
   });
+
+  test("a pool may declare where its own runners register", () => {
+    const pools = JSON.parse(POOLS);
+    pools[0].runnerRepo = "example-org/repo-scoped";
+    // No GITHUB_ORG at all: a repo-scoped pool does not need one.
+    expect(loadConfig({ ...BASE, BANTO_POOLS: JSON.stringify(pools) }).pools[0]?.runnerRepo).toBe(
+      "example-org/repo-scoped",
+    );
+  });
+
+  test("a pool with no runnerRepo carries none, unchanged from before the field existed", () => {
+    expect(loadConfig(BASE).pools[0]?.runnerRepo).toBeUndefined();
+  });
+
+  test("rejects a runnerRepo that is not owner/repo", () => {
+    // The same predicate GITHUB_REPOS entries get, and for the same reason: a
+    // name that passed a looser check here and was rejected later by the
+    // client would silently cross-check nothing for that pool.
+    for (const bad of ["../repo", "owner/..", "nope", "owner/re po", "a/b/c"]) {
+      const pools = JSON.parse(POOLS);
+      pools[0].runnerRepo = bad;
+      expect(problems({ ...BASE, BANTO_POOLS: JSON.stringify(pools) }).join()).toContain("is not owner/repo");
+    }
+  });
+
+  test("rejects an empty runnerRepo rather than treating it as unset", () => {
+    const pools = JSON.parse(POOLS);
+    pools[0].runnerRepo = "";
+    expect(problems({ ...BASE, BANTO_POOLS: JSON.stringify(pools) }).join()).toContain(
+      "runnerRepo must be a non-empty string",
+    );
+  });
 });
 
 describe("two pools cannot share one worker pool", () => {

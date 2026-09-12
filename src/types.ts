@@ -56,6 +56,15 @@ export interface PoolConfig {
    */
   warmSpare: number;
   cooldownSeconds: number;
+  /**
+   * `owner/repo` this pool's runners register to, when that is not
+   * `GITHUB_ORG`. GitHub's runner list is scoped to wherever the registration
+   * token was minted for, and asking the wrong scope returns an empty list,
+   * not an error — indistinguishable from "no runners exist" unless something
+   * knows to ask the other endpoint. Unset means "use `GITHUB_ORG`", which is
+   * the only behaviour a config written before this field existed can have.
+   */
+  runnerRepo?: string;
 }
 
 /**

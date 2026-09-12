@@ -38,11 +38,11 @@ export interface Listing<T> {
 /**
  * The runner cross-check, with "not configured" kept distinct from "failed".
  *
- * The first is a deployment choice — no `GITHUB_ORG`, so there is no runner
- * list to read — and a pool can still be scaled down on the cooldown. The
- * second is missing evidence, and missing evidence must block a lowering. A
- * single nullable value collapsed the two and let a failed cross-check read as
- * an absent one.
+ * The first is a deployment choice — neither the calling pool nor `GITHUB_ORG`
+ * names a scope to ask, so there is no runner list to read — and a pool can
+ * still be scaled down on the cooldown. The second is missing evidence, and
+ * missing evidence must block a lowering. A single nullable value collapsed
+ * the two and let a failed cross-check read as an absent one.
  */
 export type RunnerListing = { configured: false } | ({ configured: true } & Listing<ObservedRunner>);
 
@@ -56,8 +56,17 @@ export interface RateLimitState {
 export interface GitHubClient {
   /** Every job currently queued or running in the watched repositories. */
   observeJobs(): Promise<Listing<ObservedJob>>;
-  /** The self-hosted runners registered with the org, and whether each is busy. */
-  observeRunners(): Promise<RunnerListing>;
+  /**
+   * The self-hosted runners registered with `repo` (when given) or the org,
+   * and whether each is busy.
+   *
+   * `repo` is the calling pool's own registration scope, not a deployment-wide
+   * setting: two calls in the same pass can legitimately ask about different
+   * things, one pool at a time, because the client has no notion of "pool" —
+   * only the controller does. Omit it to ask the org, which is what every pool
+   * did before this parameter existed.
+   */
+  observeRunners(repo?: string): Promise<RunnerListing>;
   /** The rate-limit headers from the most recent call, if any were seen. */
   rateLimit(): RateLimitState | null;
 }
@@ -68,7 +77,12 @@ export interface GitHubAppOptions {
   privateKey: string;
   /** Explicit `owner/repo` list. Empty means "ask the installation". */
   repos?: string[];
-  /** Org whose runner registrations are cross-checked during reconcile. */
+  /**
+   * Org whose runner registrations are cross-checked during reconcile, for
+   * pools that do not declare their own `runnerRepo`. Deployment-wide, unlike
+   * `runnerRepo`, because there is exactly one GitHub App installation per
+   * client — see "One GitHub App, one installation" in the README.
+   */
   org?: string;
   apiBaseUrl?: string;
   fetchImpl?: Fetcher;
@@ -210,15 +224,39 @@ export class GitHubAppClient implements GitHubClient {
   }
 
   /**
-   * `GET /orgs/{org}/actions/runners`, the cross-check that turns "we set the
-   * instance count" into "the instances actually became runners". Needs the
-   * App's `Organization -> Self-hosted runners` permission, which the App that
-   * registers these runners already has.
+   * `GET /repos/{owner}/{repo}/actions/runners` when the calling pool declares
+   * where it registers, otherwise `GET /orgs/{org}/actions/runners` — the
+   * cross-check that turns "we set the instance count" into "the instances
+   * actually became runners". Needs the App's `Organization -> Self-hosted
+   * runners` permission for the org form, or `Administration: read` on the
+   * repository for the repo form. Not `Actions: read` — that covers runs and
+   * jobs; GitHub describes this endpoint as needing admin access to the
+   * repository, which for an App is Administration. An App that mints runner
+   * registration tokens already holds the write version of it.
+   *
+   * The two endpoints share this method's pagination and row-classification
+   * because a runner row means the same thing at either one: an id, a `busy`
+   * flag, a status, a set of labels, folded into a listing the same way
+   * `total_count` disagreements and repeated rows are folded for the org form
+   * today. Only the URL differs.
    */
-  async observeRunners(): Promise<RunnerListing> {
+  async observeRunners(repo?: string): Promise<RunnerListing> {
+    if (repo !== undefined) {
+      // Defense in depth, not the primary guard: config validates a pool's
+      // `runnerRepo` with this exact predicate at startup. Reaching this with
+      // an unsafe name would mean that guard was bypassed, and the safe
+      // response is not "not configured" — the pool did declare a scope, so
+      // failing open to the cooldown would be exactly the gap this parameter
+      // exists to close. Missing evidence blocks a lowering instead.
+      if (!isSafeRepoName(repo)) return { configured: true, items: [], complete: false };
+      return this.fetchRunnerListing(`/repos/${repo}/actions/runners`);
+    }
     const org = this.options.org;
     if (!org) return { configured: false };
+    return this.fetchRunnerListing(`/orgs/${org}/actions/runners`);
+  }
 
+  private async fetchRunnerListing(basePath: string): Promise<RunnerListing> {
     // Keyed by id: GitHub paginates by offset, so a registration change between
     // two page fetches shifts the window and can return one runner twice while
     // never returning another. Counting raw rows against `total_count` lets the
@@ -231,7 +269,7 @@ export class GitHubAppClient implements GitHubClient {
       const body = await this.request<{
         runners?: unknown;
         total_count?: unknown;
-      }>(`/orgs/${org}/actions/runners?per_page=100&page=${page}`, "GitHub runner listing");
+      }>(`${basePath}?per_page=100&page=${page}`, "GitHub runner listing");
       if (!Array.isArray(body.runners)) {
         complete = false;
         break;
@@ -290,7 +328,7 @@ export class GitHubAppClient implements GitHubClient {
     // Distinct runners, not rows read.
     if (total !== null && byId.size < total) complete = false;
     const runners = [...byId.values()];
-    this.logger.debug("observed github runners", { org, runners: runners.length, complete });
+    this.logger.debug("observed github runners", { scope: basePath, runners: runners.length, complete });
     return { configured: true, items: runners, complete };
   }
 

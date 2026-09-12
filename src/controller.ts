@@ -262,7 +262,8 @@ export class Controller {
    * Anything that could hide demand or hide a busy runner produces the partial
    * variant, which the type system then keeps away from every lowering
    * decision. The one case that is *not* missing evidence is a cross-check that
-   * was never configured: no `GITHUB_ORG` is a deployment choice, not a gap.
+   * was never configured: no `runnerRepo` on this pool and no `GITHUB_ORG` for
+   * the deployment is a deployment choice, not a gap.
    */
   private async gatherEvidence(pool: PoolConfig): Promise<PoolEvidence> {
     let jobs: ObservedJob[] = [];
@@ -294,9 +295,16 @@ export class Controller {
 
     let runners: RunnerObservation | null = null;
     try {
-      const listing = await this.deps.github.observeRunners();
+      // A pool that registers its runners to a repository rather than the org
+      // (see `runnerRepo` on `PoolConfig`) is asked there instead. Not shared
+      // across pools even when several declare the same repo: the design
+      // choice not to hand one listing to a queued pool (see "Reconcile" in
+      // the README) applies here for the same reason it applies to jobs — a
+      // listing gathered for one pool would age while the next one waited.
+      const listing = await this.deps.github.observeRunners(pool.runnerRepo);
       if (!listing.configured) {
-        // Deliberately not a gap: there is no org to ask.
+        // Deliberately not a gap: neither this pool nor the deployment names a
+        // scope to ask.
         runners = null;
       } else if (!listing.complete) {
         return { kind: "partial", demand, reason: "runner listing incomplete" };
