@@ -216,6 +216,42 @@ describe("scale-down safety", () => {
     const { decisions } = await h.controller.reconcile();
     expect(decisions.find((d) => d.pool === "default")?.idleEvidence).toBe("cooldown");
   });
+
+  test("a repo-scoped pool's busy runner is found at its own repo, not the org", async () => {
+    // This is the production bug: five of seven deployed pools register their
+    // runners to a repository, not the org, so the org-wide listing banto
+    // always asked returned none of them — 0 runners, forever, for those
+    // pools. Missing here is not "no runners exist", it is "asked the wrong
+    // endpoint", and the difference matters because `decide()` can only refuse
+    // to shrink a busy pool when it can see the busy runner. An empty listing
+    // has nothing to see, so this safety layer was silently absent for those
+    // pools rather than merely blocked by the cooldown.
+    const github = new FakeGitHub([], []); // org-wide listing: configured, and empty
+    github.runnersByRepo["example-org/repo-scoped"] = [runner({ id: 1, busy: true })];
+    const repoPool = pool({ name: "repo-scoped", runnerRepo: "example-org/repo-scoped", max: 4 });
+    const h = harness({ pools: [repoPool], github, counts: { "repo-scoped": 2 } });
+
+    const { decisions } = await h.controller.reconcile();
+    expect(github.runnerScopes).toEqual(["example-org/repo-scoped"]);
+    expect(decisions[0]?.outcome).toBe("blocked_runner_busy");
+  });
+
+  test("a repo-scoped pool's staffing is measured against its own repo, not the org", async () => {
+    // The other half of the same production bug: with no runners visible at
+    // the org, banto reported a permanent, false staffing failure for
+    // instances that had in fact registered — to the repo it never asked.
+    const github = new FakeGitHub([], []); // org-wide listing: configured, and empty
+    github.runnersByRepo["example-org/repo-scoped"] = [runner({ id: 1, busy: false }), runner({ id: 2, busy: false })];
+    const repoPool = pool({ name: "repo-scoped", runnerRepo: "example-org/repo-scoped", max: 4 });
+    const { logger, lines } = collectLogger();
+    const h = harness({ pools: [repoPool], github, counts: { "repo-scoped": 2 }, logger });
+
+    await h.controller.reconcile();
+    h.clock.advance(6 * 60_000);
+    lines.length = 0;
+    await h.controller.reconcile();
+    expect(lines.find((line) => line.message === "worker pool instances are not becoming runners")).toBeUndefined();
+  });
 });
 
 describe("reconcile", () => {
@@ -234,6 +270,24 @@ describe("reconcile", () => {
     await h.controller.reconcile();
     expect(h.github.calls).toBe(2);
     expect(h.github.runnerCalls).toBe(2);
+  });
+
+  test("two pools sharing one runnerRepo still fetch it separately, for the same reason", async () => {
+    // Deliberate, not an oversight: sharing one runner listing between pools
+    // in the same reconcile would mean the second pool decides on evidence
+    // gathered before the first pool's pass even started, which is exactly the
+    // staleness this design refuses to accept for the job listing. A shared
+    // scope does not change that argument, so it is not special-cased.
+    const shared = "example-org/shared-repo";
+    const a = pool({ name: "a", labels: ["self-hosted", "a"], runnerRepo: shared, max: 3 });
+    const b = pool({ name: "b", labels: ["self-hosted", "b"], runnerRepo: shared, max: 3 });
+    const github = new FakeGitHub([]);
+    github.runnersByRepo[shared] = [runner({ id: 1, busy: false, labels: ["self-hosted", "a"] })];
+    const h = harness({ pools: [a, b], github, jobs: [] });
+
+    await h.controller.reconcile();
+    expect(h.github.runnerCalls).toBe(2);
+    expect(github.runnerScopes).toEqual([shared, shared]);
   });
 
   test("a sustained staffing shortfall is reported as an error", async () => {
