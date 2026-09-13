@@ -85,7 +85,12 @@ why one runner per instance matters. Point `runner_image` at your own build.
 
 1. Add the real secret versions (above).
 2. Create the GitHub App, following "Pointing a GitHub App at it" in the main
-   README — its Webhook URL is `${output.banto_url}/webhook`.
+   README. Its Webhook URL is the service URL with `/webhook` on the end, which
+   you can print:
+
+   ```sh
+   echo "$(terraform output -raw banto_url)/webhook"
+   ```
 3. Install the App on `var.github_org` (or just the repositories in
    `var.github_repos`), and confirm the installation id matches
    `var.gh_app_installation_id`.
