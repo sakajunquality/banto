@@ -76,6 +76,8 @@ export class FakeGitHub implements GitHubClient {
   runnerError: Error | null = null;
   jobsComplete = true;
   runnersComplete = true;
+  /** Settable stand-in for `x-ratelimit-*` headers; null means "nothing observed yet". */
+  rateLimitValue: RateLimitState | null = null;
 
   constructor(
     public jobs: ObservedJob[] = [],
@@ -106,7 +108,7 @@ export class FakeGitHub implements GitHubClient {
   }
 
   rateLimit(): RateLimitState | null {
-    return null;
+    return this.rateLimitValue;
   }
 }
 

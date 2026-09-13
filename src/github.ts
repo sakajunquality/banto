@@ -517,10 +517,13 @@ export class GitHubAppClient implements GitHubClient {
   }
 
   /**
-   * Track the installation's remaining budget. Every pass costs calls, so the
-   * operator needs to see the budget draining before it runs out — an exhausted
-   * limit turns every listing into "evidence unavailable", which is safe (no
-   * scale-down) but stops banto staffing anything.
+   * Track the installation's remaining budget so `rateLimit()` has something
+   * current to report. This only records the headers; it does not itself
+   * decide whether the budget is worrying. That decision needs to be made
+   * once per sweep across every pool sharing this one client, not once per
+   * HTTP call — see `Controller.reportBudget`, the caller of `rateLimit()`.
+   * Warning here too would double-report the same installation-wide number
+   * once per call in addition to once per reconcile.
    */
   private recordRateLimit(headers: Headers): void {
     const remaining = parseHeaderInt(headers, "x-ratelimit-remaining");
@@ -528,13 +531,6 @@ export class GitHubAppClient implements GitHubClient {
     const reset = parseHeaderInt(headers, "x-ratelimit-reset");
     if (remaining === null || limit === null) return;
     this.lastRateLimit = { remaining, limit, resetAt: (reset ?? 0) * 1000 };
-    if (limit > 0 && remaining <= limit / 10) {
-      this.logger.warn("GitHub API budget is nearly spent", {
-        remaining,
-        limit,
-        resetAt: reset === null ? null : new Date(reset * 1000).toISOString(),
-      });
-    }
   }
 
   private async installationToken(): Promise<string> {

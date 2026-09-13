@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { Controller } from "../src/controller.ts";
+import {
+  Controller,
+  POOL_NO_MATCH_WARNING_MS,
+} from "../src/controller.ts";
 import { decide } from "../src/decide.ts";
 import { nullLogger } from "../src/log.ts";
 import { MemoryDemandStore } from "../src/store.ts";
@@ -477,5 +480,221 @@ describe("a pool above its own ceiling", () => {
     h.clock.advance(30 * 60_000);
     await h.controller.reconcile();
     expect(h.workerPools.countOf("small")).toBe(1);
+  });
+});
+
+describe("reporting the GitHub API budget", () => {
+  test("an ordinary budget is reported at DEBUG, once per reconcile sweep, not once per pool", async () => {
+    const { logger, lines } = collectLogger();
+    const github = new FakeGitHub([]);
+    github.rateLimitValue = { remaining: 4500, limit: 5000, resetAt: T0 + 3_600_000 };
+    // Two pools, so a naive "report from inside runPass" would print this twice.
+    const h = harness({ github, logger });
+
+    await h.controller.reconcile();
+
+    const budgetLines = lines.filter((line) => line.message === "GitHub API budget");
+    expect(budgetLines).toHaveLength(1);
+    expect(budgetLines[0]).toMatchObject({
+      severity: "DEBUG",
+      remaining: 4500,
+      limit: 5000,
+      percentRemaining: 90,
+    });
+    expect(lines.some((line) => line.severity === "WARNING" || line.severity === "ERROR")).toBe(false);
+  });
+
+  test("a tight budget is reported as a warning", async () => {
+    const { logger, lines } = collectLogger();
+    const github = new FakeGitHub([]);
+    const limit = 5000;
+    // Literal, not derived from the constant under test. Computing the input
+    // from `BUDGET_WARNING_REMAINING_FRACTION` would move the input with the
+    // threshold, so the test would pass for any value of it — pinning the
+    // comparison operator rather than the number. 1000 is 20% of 5000, the
+    // documented boundary, and at-or-below is inclusive.
+    github.rateLimitValue = { remaining: 1000, limit, resetAt: T0 };
+    const h = harness({ github, logger });
+
+    await h.controller.reconcile();
+
+    expect(lines.find((line) => line.message === "GitHub API budget is running low")).toMatchObject({
+      severity: "WARNING",
+    });
+  });
+
+  test("evidence banto could not complete does not count toward the no-match window", async () => {
+    // The window is meant to say "this pool's selector matched nothing while
+    // banto was looking properly". A partial pass reports demand 0 because it
+    // could not finish counting, not because there was nothing to count —
+    // attributing that to a drifted label would point the operator at the
+    // wrong thing during an outage they can already see elsewhere.
+    const { logger, lines } = collectLogger();
+    const github = new FakeGitHub([]);
+    github.jobsComplete = false;
+    const h = harness({ github, logger });
+
+    await h.controller.reconcile();
+    h.clock.advance(POOL_NO_MATCH_WARNING_MS + 60_000);
+    await h.controller.reconcile();
+
+    expect(lines.filter((line) => line.message === "pool has matched no job in an extended window")).toEqual([]);
+  });
+
+  test("a near-exhausted budget is reported as an error, the staffing alarm's own tier", async () => {
+    const { logger, lines } = collectLogger();
+    const github = new FakeGitHub([]);
+    const limit = 5000;
+    // Literal for the same reason as the warning case above: 250 is 5% of
+    // 5000. Derived from the constant, this test still passed with the
+    // threshold set to zero.
+    github.rateLimitValue = { remaining: 250, limit, resetAt: T0 };
+    const h = harness({ github, logger });
+
+    await h.controller.reconcile();
+
+    expect(lines.find((line) => line.message === "GitHub API budget is nearly exhausted")).toMatchObject({
+      severity: "ERROR",
+    });
+  });
+
+  test("reports what was spent since the last report, not a bare snapshot", async () => {
+    const { logger, lines } = collectLogger();
+    const github = new FakeGitHub([]);
+    const resetAt = T0 + 3_600_000;
+    github.rateLimitValue = { remaining: 1000, limit: 5000, resetAt };
+    const h = harness({ github, logger });
+    await h.controller.reconcile();
+
+    github.rateLimitValue = { remaining: 850, limit: 5000, resetAt };
+    lines.length = 0;
+    await h.controller.reconcile();
+
+    expect(lines.find((line) => line.message?.toString().startsWith("GitHub API budget"))).toMatchObject({
+      consumedSincePreviousReport: 150,
+    });
+  });
+
+  test("a reset rollover is not reported as budget regained", async () => {
+    const { logger, lines } = collectLogger();
+    const github = new FakeGitHub([]);
+    github.rateLimitValue = { remaining: 50, limit: 5000, resetAt: T0 };
+    const h = harness({ github, logger });
+    await h.controller.reconcile();
+
+    // The hourly window rolled over: remaining jumped back up under a new resetAt.
+    github.rateLimitValue = { remaining: 4900, limit: 5000, resetAt: T0 + 3_600_000 };
+    lines.length = 0;
+    await h.controller.reconcile();
+
+    const report = lines.find((line) => line.message?.toString().startsWith("GitHub API budget"));
+    expect(report).toBeDefined();
+    expect(report).not.toHaveProperty("consumedSincePreviousReport");
+  });
+
+  test("nothing is reported before any call has told banto its budget", async () => {
+    // The default fake, like a fresh process, has not made a call yet.
+    const { logger, lines } = collectLogger();
+    const h = harness({ logger });
+    await h.controller.reconcile();
+    expect(lines.some((line) => line.message?.toString().startsWith("GitHub API budget"))).toBe(false);
+  });
+});
+
+describe("a pool that never matches a job", () => {
+  const BUILD_ONLY = pool({ name: "build", labels: ["self-hosted", "runner-build"], max: 2 });
+
+  test("is not flagged before the window elapses, and is flagged once it does", async () => {
+    const { logger, lines } = collectLogger();
+    const h = harness({ pools: [BUILD_ONLY], jobs: [], logger });
+
+    await h.controller.reconcile();
+    expect(lines.find((line) => line.message === "pool has matched no job in an extended window")).toBeUndefined();
+
+    h.clock.advance(POOL_NO_MATCH_WARNING_MS - 1000);
+    lines.length = 0;
+    await h.controller.reconcile();
+    expect(lines.find((line) => line.message === "pool has matched no job in an extended window")).toBeUndefined();
+
+    h.clock.advance(2000);
+    lines.length = 0;
+    await h.controller.reconcile();
+    expect(lines.find((line) => line.message === "pool has matched no job in an extended window")).toMatchObject({
+      severity: "WARNING",
+      pool: "build",
+      labels: BUILD_ONLY.labels,
+    });
+  });
+
+  test("a single match resets the window instead of leaving it measured from startup", async () => {
+    const { logger, lines } = collectLogger();
+    const h = harness({ pools: [BUILD_ONLY], jobs: jobsFor([1], BUILD_ONLY.labels), logger });
+
+    await h.controller.reconcile(); // demand > 0: the anchor moves to now
+    h.github.jobs = [];
+
+    h.clock.advance(POOL_NO_MATCH_WARNING_MS - 1000);
+    lines.length = 0;
+    await h.controller.reconcile();
+    expect(lines.find((line) => line.message === "pool has matched no job in an extended window")).toBeUndefined();
+
+    h.clock.advance(2000);
+    lines.length = 0;
+    await h.controller.reconcile();
+    expect(lines.find((line) => line.message === "pool has matched no job in an extended window")).toBeDefined();
+  });
+});
+
+describe("unmatched jobs are summarised, not spammed", () => {
+  test("repeats of one label set are counted and reported once, at reconcile", async () => {
+    const { logger, lines } = collectLogger();
+    const h = harness({ logger });
+
+    for (let i = 0; i < 3; i++) {
+      await h.controller.handleWorkflowJob(event("queued", ["ubuntu-latest"]));
+    }
+    // Per-event detail stays at DEBUG — unchanged, and still too noisy for INFO.
+    expect(lines.filter((line) => line.message === "no pool matches job labels")).toHaveLength(3);
+    expect(lines.some((line) => line.message === "jobs matched no configured pool since the last reconcile")).toBe(
+      false,
+    );
+
+    lines.length = 0;
+    await h.controller.reconcile();
+    expect(lines.find((line) => line.message === "jobs matched no configured pool since the last reconcile")).toMatchObject({
+      severity: "INFO",
+      total: 3,
+      distinctLabelSets: 1,
+      bySignature: [{ labels: "ubuntu-latest", count: 3 }],
+    });
+
+    // Drained: a reconcile with nothing new to report says nothing.
+    lines.length = 0;
+    await h.controller.reconcile();
+    expect(lines.some((line) => line.message === "jobs matched no configured pool since the last reconcile")).toBe(
+      false,
+    );
+  });
+
+  test("distinct label sets are tallied separately and ranked by count", async () => {
+    const { logger, lines } = collectLogger();
+    const h = harness({ logger });
+
+    for (let i = 0; i < 2; i++) await h.controller.handleWorkflowJob(event("queued", ["ubuntu-latest"]));
+    for (let i = 0; i < 5; i++) await h.controller.handleWorkflowJob(event("queued", ["windows-latest"]));
+    // Case and order must not fragment one drifted set into two counts.
+    await h.controller.handleWorkflowJob(event("queued", ["Self-Hosted", "Runner-Ghost"]));
+    await h.controller.handleWorkflowJob(event("queued", ["runner-ghost", "self-hosted"]));
+
+    await h.controller.reconcile();
+    const summary = lines.find((line) => line.message === "jobs matched no configured pool since the last reconcile");
+    expect(summary).toMatchObject({ total: 9, distinctLabelSets: 3 });
+    // Descending by count; a stable sort keeps the two tied entries in the
+    // order their signature was first seen (ubuntu before the ghost mix).
+    expect(summary?.bySignature).toEqual([
+      { labels: "windows-latest", count: 5 },
+      { labels: "ubuntu-latest", count: 2 },
+      { labels: "runner-ghost,self-hosted", count: 2 },
+    ]);
   });
 });
