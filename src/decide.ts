@@ -15,14 +15,8 @@ import type { PoolConfig, PoolEvidence, PoolState, RunnerObservation } from "./t
  *   1. the listing is complete — partial evidence may never lower a count;
  *   2. no job for this pool is running, per that listing;
  *   3. no runner for this pool is busy, per GitHub's runner list; and
- *   4. either that runner list positively shows idle runners, or
- *      `cooldownSeconds` have passed since the last pass in which every
- *      instance was justified (demand at least matched the count, or a runner
- *      was busy).
- *
- * The runner list is the better signal by a wide margin: `busy` is GitHub's own
- * statement about the runner that would be stopped. The cooldown is the
- * fallback for when that list is unavailable.
+ *   4. `cooldownSeconds` have passed since work or incomplete evidence was
+ *      last observed. Online idle runners never bypass that grace period.
  */
 
 export type DecisionOutcome =
@@ -47,7 +41,7 @@ export interface Decision {
   write: boolean;
   /** Seconds left on the idle cooldown, when that is what is holding. */
   cooldownRemainingSeconds?: number;
-  /** What allowed a scale-down: a positive idle runner list, or the cooldown. */
+  /** Scale-down now always requires the cooldown; runners never bypass it. */
   idleEvidence?: "runners" | "cooldown";
   /** False when this decision was made on evidence that might be partial. */
   evidenceComplete: boolean;
@@ -124,13 +118,6 @@ export function decide(
   // pool under it.
   if (runners !== null && runners.busy > 0) {
     return { ...base, target: current, outcome: "blocked_runner_busy", write: false };
-  }
-
-  // Online runners, none of them busy, nothing queued: direct evidence that
-  // stopping an instance stops an idle one. An empty runner list is not that —
-  // it is the staffing-failure case — so it falls through to the cooldown.
-  if (runners !== null && runners.online > 0 && runners.busy === 0) {
-    return { ...base, target: desired, outcome: "scale_down", write: true, idleEvidence: "runners" };
   }
 
   const cooldownMs = pool.cooldownSeconds * 1000;

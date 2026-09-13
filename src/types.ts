@@ -16,8 +16,8 @@ export type JobStatus = "queued" | "in_progress";
  *
  * What is left cannot be derived from a single listing:
  *
- *  - `lastBusyAt` is the last time every instance of this pool was justified —
- *    demand at least matched the instance count, or a runner was busy. The idle
+ *  - `lastBusyAt` is the last time this pool had observed work, a busy
+ *    runner, or incomplete evidence. The idle
  *    cooldown counts from it, and no API call answers "when was that".
  *  - `shortfallSince` is when instances first outnumbered online runners and
  *    have ever since — a duration across passes, not a fact about one.

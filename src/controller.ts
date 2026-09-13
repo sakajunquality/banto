@@ -250,45 +250,21 @@ export class Controller {
     await this.respectPassInterval(pool.name);
     this.lastPassAt.set(pool.name, this.deps.clock.now());
 
-    const evidence = await this.gatherEvidence(pool);
-    const { instanceCount, etag } = await this.deps.workerPools.get(pool);
-    const at = this.deps.clock.now();
-
-    const runners = evidence.kind === "complete" ? evidence.runners : null;
-    const staffing = trackStaffing((await this.deps.store.get(pool.name)).state, instanceCount, runners, at);
-    this.reportStaffing(pool, instanceCount, runners, staffing);
-    this.reportPoolMatch(pool, evidence, at);
-
-    // Recorded *before* the scaling write, and a failure here fails the pass.
-    // The alternative — write first, record after — loses the record of a busy
-    // pool exactly when the store is unhappy, and a lost `lastBusyAt` is a
-    // cooldown that never starts.
-    // "Busy" means *every instance was justified*: demand at least matched the
-    // count, or a runner was working. Refreshing the anchor whenever there was
-    // any demand at all was wrong in a way only an interleaving test found — a
-    // pool with steady demand of 3 and 4 instances refreshed its own anchor on
-    // every pass and could never shed the fourth.
-    const busy = (evidence.demand > 0 && evidence.demand >= instanceCount) || (runners?.busy ?? 0) > 0;
-    const state = await mutate(
-      this.deps.store,
-      pool.name,
-      (current) => ({
-        // First pass for a pool seeds the anchor with now: an unknown history
-        // is treated as "busy just now", so a pool is never scaled away on the
-        // strength of having no record. An anchor that cannot be used — absurd,
-        // or in the future because a clock stepped — is *repaired* the same
-        // way, so a bad value costs one cooldown instead of standing forever.
-        lastBusyAt: busy ? at : (usableAnchor(current.lastBusyAt, at) ?? at),
-        shortfallSince:
-          runners === null ? (current.shortfallSince ?? null) : (staffing.state.shortfallSince ?? null),
-      }),
-      this.deps.retry ?? {},
-    );
-
-    const decision = decide(pool, evidence, state, instanceCount, at);
-    if (decision.write) {
-      await this.deps.workerPools.setInstanceCount(pool, decision.target, etag);
+    let evidence = await this.gatherEvidence(pool);
+    let observation = await this.recordObservation(pool, evidence);
+    let decision = decide(pool, evidence, observation.state, observation.instanceCount, observation.at);
+    if (decision.outcome === "scale_down") {
+      // Re-fetch after the first state write: work can arrive while storage or
+      // Cloud Run reads are in flight. This narrows, but cannot close, the gap
+      // between the final GitHub observation and the Cloud Run PATCH.
+      evidence = await this.gatherEvidence(pool);
+      observation = await this.recordObservation(pool, evidence);
+      decision = decide(pool, evidence, observation.state, observation.instanceCount, observation.at);
     }
+    if (decision.write) {
+      await this.deps.workerPools.setInstanceCount(pool, decision.target, observation.etag);
+    }
+    const runners = evidence.kind === "complete" ? evidence.runners : null;
 
     this.deps.logger.info("scaling decision", {
       pool: decision.pool,
@@ -308,6 +284,41 @@ export class Controller {
         : { cooldownRemainingSeconds: decision.cooldownRemainingSeconds }),
     });
     return decision;
+  }
+
+  private async recordObservation(pool: PoolConfig, evidence: PoolEvidence) {
+    const { instanceCount, etag } = await this.deps.workerPools.get(pool);
+    const at = this.deps.clock.now();
+
+    const runners = evidence.kind === "complete" ? evidence.runners : null;
+    const staffing = trackStaffing((await this.deps.store.get(pool.name)).state, instanceCount, runners, at);
+    this.reportStaffing(pool, instanceCount, runners, staffing);
+    this.reportPoolMatch(pool, evidence, at);
+
+    // Recorded *before* the scaling write, and a failure here fails the pass.
+    // The alternative — write first, record after — loses the record of a busy
+    // pool exactly when the store is unhappy, and a lost `lastBusyAt` is a
+    // cooldown that never starts.
+    // Any observed work or missing evidence restarts the quiet period. Excess
+    // capacity is retained while work remains, rather than treating it as idle.
+    const busy = evidence.kind === "partial" || evidence.demand > 0 || (runners?.busy ?? 0) > 0;
+    const state = await mutate(
+      this.deps.store,
+      pool.name,
+      (current) => ({
+        // First pass for a pool seeds the anchor with now: an unknown history
+        // is treated as "busy just now", so a pool is never scaled away on the
+        // strength of having no record. An anchor that cannot be used — absurd,
+        // or in the future because a clock stepped — is *repaired* the same
+        // way, so a bad value costs one cooldown instead of standing forever.
+        lastBusyAt: busy ? at : (usableAnchor(current.lastBusyAt, at) ?? at),
+        shortfallSince:
+          runners === null ? (current.shortfallSince ?? null) : (staffing.state.shortfallSince ?? null),
+      }),
+      this.deps.retry ?? {},
+    );
+
+    return { instanceCount, etag, at, state };
   }
 
   /**

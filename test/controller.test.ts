@@ -137,11 +137,14 @@ describe("scale-down safety", () => {
     expect(decisions.find((d) => d.pool === "default")?.outcome).toBe("blocked_runner_busy");
   });
 
-  test("idle runners allow it without waiting out the cooldown", async () => {
+  test("idle runners wait for the cooldown and eventually scale to zero", async () => {
     const github = new FakeGitHub([], [runner({ id: 1, busy: false })]);
     const h = harness({ github, counts: { default: 1 } });
     const { decisions } = await h.controller.reconcile();
-    expect(decisions.find((d) => d.pool === "default")?.idleEvidence).toBe("runners");
+    expect(decisions.find((d) => d.pool === "default")?.outcome).toBe("blocked_cooldown");
+    expect(h.workerPools.countOf("default")).toBe(1);
+    h.clock.advance(300_000);
+    await h.controller.reconcile();
     expect(h.workerPools.countOf("default")).toBe(0);
   });
 
@@ -340,17 +343,18 @@ describe("recording an observation", () => {
     expect(h.workerPools.writes).toEqual([]);
   });
 
-  test("a pool with steady demand can still shed the instances above it", async () => {
-    // The anchor records when every instance was justified, not merely when
-    // there was any work: refreshing it on any demand at all left a pool with
-    // three jobs and four instances unable to ever drop the fourth.
+  test("queued work keeps surplus capacity until the pool becomes quiet", async () => {
     const h = harness({ jobs: jobsFor([1, 2, 3], ["self-hosted", "runner-default"]), counts: { default: 4 } });
     await h.controller.reconcile();
     expect(h.workerPools.countOf("default")).toBe(4);
 
     h.clock.advance(6 * 60_000);
     await h.controller.reconcile();
-    expect(h.workerPools.countOf("default")).toBe(3);
+    expect(h.workerPools.countOf("default")).toBe(4);
+    h.github.jobs = [];
+    h.clock.advance(300_000);
+    await h.controller.reconcile();
+    expect(h.workerPools.countOf("default")).toBe(0);
   });
 
   test("a first pass seeds the anchor, so an unknown history is not a licence to scale away", async () => {
@@ -382,14 +386,7 @@ describe("repairing an unusable anchor", () => {
 describe("the cooldown anchor without the org cross-check", () => {
   const solo = pool({ name: "solo", workerPool: "solo-runner", labels: ["self-hosted", "solo"], cooldownSeconds: 300 });
 
-  test("does not refresh while a job runs on a pool with spare instances", async () => {
-    // The README recommends a generous `cooldownSeconds` for exactly this
-    // deployment — no `GITHUB_ORG`, so no runner observations, the cooldown
-    // carrying the decision alone. It does not do what that suggests. The
-    // anchor only restarts when *every* instance was justified, so three
-    // instances with one running job never refresh it, and the cooldown has
-    // already elapsed by the time the job ends. Asserted here because the
-    // README now says so and must keep saying something true.
+  test("refreshes while a job runs even with spare instances and no runner cross-check", async () => {
     const h = harness({
       pools: [solo],
       counts: { solo: 3 },
@@ -398,21 +395,23 @@ describe("the cooldown anchor without the org cross-check", () => {
 
     const first = await h.controller.reconcile();
     expect(first.decisions[0]?.outcome).toBe("blocked_in_progress");
-    const anchor = (await h.store.get("solo")).state.lastBusyAt;
+
 
     // Half an hour of the job running, on a 5-minute cooldown.
     for (let i = 0; i < 6; i++) {
       h.clock.advance(5 * 60_000);
       await h.controller.reconcile();
     }
-    expect((await h.store.get("solo")).state.lastBusyAt).toBe(anchor);
+    expect((await h.store.get("solo")).state.lastBusyAt).toBe(h.clock.now());
 
-    // The job ends. One second later the pool is cut to zero on a cooldown
-    // that elapsed twenty-nine minutes ago.
+    // Completion does not bypass the grace period.
     h.github.jobs = [];
     h.clock.advance(1000);
     const last = await h.controller.reconcile();
-    expect(last.decisions[0]?.outcome).toBe("scale_down");
+    expect(last.decisions[0]?.outcome).toBe("blocked_cooldown");
+    expect(h.workerPools.countOf("solo")).toBe(3);
+    h.clock.advance(300_000);
+    await h.controller.reconcile();
     expect(h.workerPools.countOf("solo")).toBe(0);
   });
 });
@@ -421,11 +420,7 @@ describe("a pool above its own ceiling", () => {
   const small = pool({ name: "small", workerPool: "small-runner", labels: ["self-hosted", "small"], max: 2 });
 
   test("waits out the cooldown when no runner has registered", async () => {
-    // Something else set the count above `max` — a deploy, a human, or `max`
-    // being lowered. Nothing has registered, so there is no runner evidence and
-    // the cooldown governs. Note what this does NOT assert: queued demand is
-    // not what holds the count up. The next test is the same situation with
-    // runners present, and it comes down.
+    // External excess capacity must not bypass the quiet period.
     const h = harness({
       pools: [small],
       counts: { small: 4 },
@@ -447,12 +442,7 @@ describe("a pool above its own ceiling", () => {
     expect(h.workerPools.countOf("small")).toBe(4);
   });
 
-  test("is cut back to the ceiling once its runners are seen idle", async () => {
-    // Queued demand far above `max` does not keep the surplus alive. The moment
-    // GitHub confirms nothing is in progress and the pool's runners are idle,
-    // the count drops to `max` — `max` is a ceiling, not a target to grow into.
-    // Asserted here because the README states this and the property layer
-    // cannot reach it: its external writer is capped at `max`.
+  test("does not cut idle runners while queued work remains", async () => {
     const github = new FakeGitHub(
       jobsFor([1, 2, 3, 4, 5, 6, 7, 8, 9], ["self-hosted", "small"]),
       [1, 2, 3, 4].map((id) =>
@@ -465,12 +455,11 @@ describe("a pool above its own ceiling", () => {
 
     expect(decisions[0]?.demand).toBe(9);
     expect(decisions[0]?.desired).toBe(2);
-    expect(decisions[0]?.outcome).toBe("scale_down");
-    expect(decisions[0]?.idleEvidence).toBe("runners");
-    expect(h.workerPools.countOf("small")).toBe(2);
+    expect(decisions[0]?.outcome).toBe("blocked_cooldown");
+    expect(h.workerPools.countOf("small")).toBe(4);
   });
 
-  test("comes down once demand falls below the count", async () => {
+  test("comes down after demand disappears and the cooldown elapses", async () => {
     const h = harness({
       pools: [small],
       counts: { small: 4 },
@@ -479,7 +468,11 @@ describe("a pool above its own ceiling", () => {
     await h.controller.reconcile();
     h.clock.advance(30 * 60_000);
     await h.controller.reconcile();
-    expect(h.workerPools.countOf("small")).toBe(1);
+    expect(h.workerPools.countOf("small")).toBe(4);
+    h.github.jobs = [];
+    h.clock.advance(300_000);
+    await h.controller.reconcile();
+    expect(h.workerPools.countOf("small")).toBe(0);
   });
 });
 
@@ -696,5 +689,78 @@ describe("unmatched jobs are summarised, not spammed", () => {
       { labels: "ubuntu-latest", count: 2 },
       { labels: "runner-ghost,self-hosted", count: 2 },
     ]);
+  });
+});
+
+describe("scale-down confirmation", () => {
+  for (const change of ["queued", "running", "busy", "partial jobs", "partial runners", "runner failure"] as const) {
+    test(`retains capacity when ${change} appears after the first observation`, async () => {
+      const github = new FakeGitHub([], [runner()]);
+      const h = harness({ pools: [DEFAULT], github, counts: { default: 2 } });
+      await h.store.put("default", { lastBusyAt: T0 - 600_000 }, null);
+      const put = h.store.put.bind(h.store);
+      let writes = 0;
+      h.store.put = async (...args) => {
+        const result = await put(...args);
+        if (++writes === 1) {
+          if (change === "queued") github.jobs = jobsFor([1], DEFAULT.labels);
+          if (change === "running") github.jobs = jobsFor([1], DEFAULT.labels, "in_progress");
+          if (change === "busy") github.runners = [runner({ busy: true })];
+          if (change === "partial jobs") github.jobsComplete = false;
+          if (change === "partial runners") github.runnersComplete = false;
+          if (change === "runner failure") github.runnerError = new Error("unavailable");
+        }
+        return result;
+      };
+      const result = await h.controller.reconcile();
+      expect(result.failures).toEqual([]);
+      expect(github.calls).toBe(2);
+      expect(h.workerPools.writes).toEqual([]);
+      expect(h.workerPools.countOf("default")).toBe(2);
+      expect((await h.store.get("default")).state.lastBusyAt).toBe(h.clock.now());
+    });
+  }
+
+  test("confirms a quiet pool twice before lowering it", async () => {
+    const github = new FakeGitHub([], [runner()]);
+    const h = harness({ pools: [DEFAULT], github, counts: { default: 1 } });
+    await h.store.put("default", { lastBusyAt: T0 - 300_000 }, null);
+    await h.controller.reconcile();
+    expect(github.calls).toBe(2);
+    expect(github.runnerCalls).toBe(2);
+    expect(h.workerPools.writes).toEqual([{ pool: "default", count: 0 }]);
+  });
+
+  test("does not add a second listing on scale-up", async () => {
+    const h = harness({ pools: [DEFAULT], jobs: jobsFor([1], DEFAULT.labels) });
+    await h.controller.reconcile();
+    expect(h.github.calls).toBe(1);
+    expect(h.workerPools.countOf("default")).toBe(1);
+  });
+
+  test("failed evidence restarts the grace period even after recovery", async () => {
+    const h = harness({ pools: [DEFAULT], counts: { default: 1 } });
+    await h.store.put("default", { lastBusyAt: T0 - 600_000 }, null);
+    h.github.jobsComplete = false;
+    await h.controller.reconcile();
+    h.github.jobsComplete = true;
+    h.clock.advance(299_999);
+    expect((await h.controller.reconcile()).decisions[0]?.outcome).toBe("blocked_cooldown");
+    h.clock.advance(1);
+    await h.controller.reconcile();
+    expect(h.workerPools.countOf("default")).toBe(0);
+  });
+
+  test("a failed confirmation state write cannot reach the scaling API", async () => {
+    const h = harness({ pools: [DEFAULT], counts: { default: 1 } });
+    await h.store.put("default", { lastBusyAt: T0 - 600_000 }, null);
+    const put = h.store.put.bind(h.store);
+    let writes = 0;
+    h.store.put = async (...args) => {
+      if (++writes === 2) throw new Error("state unavailable");
+      return put(...args);
+    };
+    expect((await h.controller.reconcile()).failures).toHaveLength(1);
+    expect(h.workerPools.writes).toEqual([]);
   });
 });
