@@ -693,7 +693,7 @@ describe("unmatched jobs are summarised, not spammed", () => {
 });
 
 describe("scale-down confirmation", () => {
-  for (const change of ["queued", "running", "busy", "partial jobs", "partial runners", "runner failure"] as const) {
+  for (const change of ["queued", "running", "busy", "partial jobs", "partial runners", "job failure", "runner failure"] as const) {
     test(`retains capacity when ${change} appears after the first observation`, async () => {
       const github = new FakeGitHub([], [runner()]);
       const h = harness({ pools: [DEFAULT], github, counts: { default: 2 } });
@@ -708,6 +708,7 @@ describe("scale-down confirmation", () => {
           if (change === "busy") github.runners = [runner({ busy: true })];
           if (change === "partial jobs") github.jobsComplete = false;
           if (change === "partial runners") github.runnersComplete = false;
+          if (change === "job failure") github.beforeObserve = async () => { throw new Error("unavailable"); };
           if (change === "runner failure") github.runnerError = new Error("unavailable");
         }
         return result;
