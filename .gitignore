@@ -3,3 +3,10 @@ node_modules/
 report.json
 *.log
 .oci-report.json
+
+# Terraform (examples/terraform)
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+*.tfplan

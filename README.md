@@ -798,270 +798,65 @@ runner-administration permission the runner image itself uses to register.
 
 ## Deploying
 
-A worked Terraform example: the service, its identity, the IAM it needs, the
-state bucket, and the Cloud Scheduler job that calls `/reconcile`.
+[`examples/terraform`](examples/terraform) is a complete, runnable
+configuration — the service, its identity, the IAM it needs, the state
+bucket, the Secret Manager containers, the Cloud Scheduler job that calls
+`/reconcile`, an Artifact Registry proxy for the published image (see below),
+and one worker pool for banto to manage. `terraform init -backend=false` and
+`terraform validate` pass on it as committed; its own README covers what it
+creates, what remains a manual step (a GitHub App's private key cannot come
+from Terraform, and neither can the runner image), and what to change first.
+What follows here is the shape of that configuration, not a copy of it — see
+the example for something you can actually apply.
+
+A service account, scoped to exactly what banto uses:
 
 ```hcl
-locals {
-  project  = "my-runners-prd"
-  location = "asia-northeast1"
-  # banto verifies the ID token itself, so this is just a string both sides
-  # agree on. Keeping it off the service URL avoids a service <-> scheduler
-  # dependency cycle.
-  reconcile_audience = "banto-reconcile"
-}
-
-# This is an excerpt, not a module you can apply unchanged. It assumes three
-# things already exist in your configuration:
-#   - `google_secret_manager_secret.banto_webhook_secret`, holding the webhook
-#     secret,
-#   - `google_secret_manager_secret.runner_app_key`, holding the GitHub App PEM
-#     (your runner pools already mount this one), and
-#   - the worker pools the `BANTO_POOLS` entries below address.
-# It also expects `var.banto_image`, declared here so the excerpt is complete.
-variable "banto_image" {
-  type        = string
-  description = "banto image, by digest — see \"The published image\" for pulling one, or \"Building the image\" for producing your own"
-}
-
-resource "google_service_account" "banto" {
-  project      = local.project
-  account_id   = "banto"
-  display_name = "banto — GitHub Actions runner pool autoscaler"
-}
-
-# Exactly the two permissions banto uses, instead of roles/run.developer.
 resource "google_project_iam_custom_role" "worker_pool_scaler" {
-  project     = local.project
   role_id     = "workerPoolScaler"
   title       = "Worker pool scaler"
   permissions = ["run.workerpools.get", "run.workerpools.update"]
 }
+```
 
-resource "google_project_iam_member" "banto_scaler" {
-  project = local.project
-  role    = google_project_iam_custom_role.worker_pool_scaler.id
-  member  = "serviceAccount:${google_service_account.banto.email}"
-}
+— instead of `roles/run.developer`, which also works and is the fallback the
+example documents for a Terraform identity that lacks `iam.roles.create`.
 
-# One small JSON object per pool, rewritten every few minutes.
-#
-# Versioning off is not enough on its own: a new bucket also has soft delete on
-# by default, which retains overwritten and deleted objects for seven days.
-# banto overwrites constantly, so that default would keep thousands of dead
-# generations that nothing will ever read. Setting the retention to zero turns
-# it off; keep the default only if you want the undelete window and are willing
-# to pay for the retained bytes.
+A state bucket, with two defaults deliberately turned off:
+
+```hcl
 resource "google_storage_bucket" "banto_state" {
-  project                     = local.project
-  name                        = "${local.project}-banto-state"
-  location                    = local.location
-  storage_class               = "STANDARD"
-  uniform_bucket_level_access = true
-  public_access_prevention    = "enforced"
-
-  versioning {
-    enabled = false
-  }
-
-  soft_delete_policy {
-    retention_duration_seconds = 0
-  }
-}
-
-# Replacing an object needs create AND delete: roles/storage.objectCreator would
-# let the first write of each pool through and fail every one after it.
-resource "google_storage_bucket_iam_member" "banto_state_writer" {
-  bucket = google_storage_bucket.banto_state.name
-  role   = "roles/storage.objectUser"
-  member = "serviceAccount:${google_service_account.banto.email}"
-}
-
-resource "google_secret_manager_secret_iam_member" "banto_webhook_secret" {
-  project   = local.project
-  secret_id = google_secret_manager_secret.banto_webhook_secret.secret_id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.banto.email}"
-}
-
-# banto mounts the App key too, so it needs access to that secret as well.
-resource "google_secret_manager_secret_iam_member" "banto_app_key" {
-  project   = local.project
-  secret_id = google_secret_manager_secret.runner_app_key.secret_id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.banto.email}"
-}
-
-resource "google_cloud_run_v2_service" "banto" {
-  project  = local.project
-  name     = "banto"
-  location = local.location
-  ingress  = "INGRESS_TRAFFIC_ALL" # GitHub has to reach /webhook
-
-  # Service level, not template level: `template.scaling.max_instance_count` is
-  # per revision, so two revisions could run an instance each. This caps the
-  # total across revisions. Required, not a tuning choice — see "running as a
-  # single instance". Provider support for this block is recent; if yours lacks
-  # it, set it with
-  # `gcloud run services update banto --region=REGION --max=1`. Note `--max`,
-  # not `--max-instances`: the latter is the per-revision cap this block exists
-  # to replace, so the fallback would install the very thing being warned about.
-  scaling {
-    max_instance_count = 1
-  }
-
-  # Keep every request on the newest revision: a traffic split keeps two
-  # revisions serving indefinitely, which makes concurrent appliers permanent.
-  traffic {
-    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
-    percent = 100
-  }
-
-  template {
-    service_account = google_service_account.banto.email
-
-    containers {
-      image = var.banto_image # built by bunko, referenced by digest
-
-      env {
-        name = "BANTO_POOLS"
-        value = jsonencode([
-          {
-            name            = "default"
-            project         = local.project
-            location        = local.location
-            workerPool      = "gh-runner-default"
-            labels          = ["self-hosted", "runner-default"]
-            min             = 1
-            max             = 5
-            warmSpare       = 1
-            cooldownSeconds = 300
-          },
-          {
-            name            = "build"
-            project         = local.project
-            location        = local.location
-            workerPool      = "gh-runner-build"
-            labels          = ["self-hosted", "runner-build"]
-            min             = 0
-            max             = 3
-            cooldownSeconds = 600
-          },
-        ])
-      }
-
-      env {
-        name  = "BANTO_GCS_BUCKET"
-        value = google_storage_bucket.banto_state.name
-      }
-      env {
-        # Two pools against a two-repository installation: ~15 calls a pass,
-        # at most 360 passes an hour each. Work this out for your own
-        # installation before deploying — see "what it costs".
-        name  = "BANTO_MIN_PASS_INTERVAL_SECONDS"
-        value = "10"
-      }
-      env {
-        name  = "GITHUB_REPOS"
-        value = "example-org/infra,example-org/app"
-      }
-      env {
-        name  = "BANTO_RECONCILE_AUDIENCE"
-        value = local.reconcile_audience
-      }
-      env {
-        name  = "BANTO_RECONCILE_ALLOWED_EMAILS"
-        value = google_service_account.banto_scheduler.email
-      }
-      env {
-        name  = "GITHUB_ORG"
-        value = "example-org"
-      }
-      env {
-        name  = "GH_APP_ID"
-        value = "123456"
-      }
-      env {
-        name  = "GH_APP_INSTALLATION_ID"
-        value = "98765432"
-      }
-      env {
-        name = "GITHUB_WEBHOOK_SECRET"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.banto_webhook_secret.secret_id
-            version = "latest"
-          }
-        }
-      }
-      env {
-        name = "GH_APP_PRIVATE_KEY"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.runner_app_key.secret_id
-            version = "latest"
-          }
-        }
-      }
-
-      ports {
-        container_port = 8080
-      }
-
-      startup_probe {
-        http_get { path = "/healthz" }
-      }
-    }
-  }
-
-  depends_on = [
-    google_secret_manager_secret_iam_member.banto_webhook_secret,
-    google_secret_manager_secret_iam_member.banto_app_key,
-  ]
-}
-
-# The webhook endpoint is public by necessity; the signature plus the
-# installation check protect it, and /reconcile verifies its own OIDC token
-# because IAM cannot cover one path of a public service.
-resource "google_cloud_run_v2_service_iam_member" "public" {
-  project  = google_cloud_run_v2_service.banto.project
-  location = google_cloud_run_v2_service.banto.location
-  name     = google_cloud_run_v2_service.banto.name
-  role     = "roles/run.invoker"
-  member   = "allUsers"
-}
-
-resource "google_service_account" "banto_scheduler" {
-  project      = local.project
-  account_id   = "banto-scheduler"
-  display_name = "Calls banto /reconcile"
-}
-
-resource "google_cloud_scheduler_job" "reconcile" {
-  project     = local.project
-  region      = local.location
-  name        = "banto-reconcile"
-  description = "Re-derive runner demand from the GitHub API and correct each pool"
-  schedule    = "*/5 * * * *"
-  time_zone   = "Etc/UTC"
-
-  attempt_deadline = "120s"
-
-  retry_config {
-    retry_count = 1
-  }
-
-  http_target {
-    http_method = "POST"
-    uri         = "${google_cloud_run_v2_service.banto.uri}/reconcile"
-
-    oidc_token {
-      service_account_email = google_service_account.banto_scheduler.email
-      audience              = local.reconcile_audience
-    }
-  }
+  versioning { enabled = false }
+  soft_delete_policy { retention_duration_seconds = 0 }
 }
 ```
+
+Versioning off is not enough on its own: a new bucket also has soft delete on
+by default, which retains overwritten and deleted objects for seven days.
+banto overwrites constantly, so that default would keep thousands of dead
+generations that nothing will ever read.
+
+A Cloud Run service with a public webhook, and a specific way of making it
+public:
+
+```hcl
+resource "google_cloud_run_v2_service_iam_member" "public" {
+  role   = "roles/run.invoker"
+  member = "allUsers"
+}
+```
+
+That binding is the ordinary way to do it and it does not work everywhere. If
+the project is under an organisation policy for **domain restricted sharing**,
+granting a role to `allUsers` is rejected. Google's guidance says these
+instructions "won't succeed" there and points at disabling the invoker IAM
+check instead — "use this solution when the project is subject to the domain
+restricted sharing constraint in an organization policy". In Terraform that is
+`invoker_iam_disabled = true` on the service, and the `allUsers` binding goes
+away entirely.
+
+Either way the whole service is public, which is the point of the paragraph
+above: Cloud Run IAM is a property of the service, not of a path.
 
 The runner pools themselves stay as they are — `scaling { scaling_mode =
 "MANUAL" }` — but drop `manual_instance_count` from Terraform's control once
@@ -1085,8 +880,8 @@ banto does not require building it:
 ```sh
 docker pull ghcr.io/sakajunquality/banto:<release tag>
 # Digest: sha256:… — that line, as ghcr.io/sakajunquality/banto@sha256:…, is
-# what var.banto_image takes. The tag is how you find the digest, not what you
-# deploy.
+# what the example's `var.banto_image_digest` takes (see examples/terraform).
+# The tag is how you find the digest, not what you deploy.
 ```
 
 Releases are listed on the repository's releases page; there is nothing to pull
@@ -1094,17 +889,17 @@ until the first one is tagged.
 
 Two tags per release and no more: the release tag, and `sha-<commit>` with the
 full commit the image was built from, so an image can always be traced back to
-the source without guessing. There is no `latest` — the Terraform above wants a
+the source without guessing. There is no `latest` — the example wants a
 digest, and a tag that follows the newest release is a way to deploy something
 nobody chose. The workflow prints the digest-pinned reference in its job summary,
-which is the shortest path from a release to `var.banto_image`.
+which is the shortest path from a release to `var.banto_image_digest`.
 
 Neither of those two is a *moving* tag, in the sense that `latest` is one by
 design. That is a statement about what the workflow publishes, not a guarantee
 the registry enforces: GHCR tags are mutable, so force-moving a git tag and
 re-running would overwrite the image a tag resolves to. If you want the
 guarantee rather than the intent, deploy the digest — which is what
-`var.banto_image` takes, and why the summary prints it.
+`var.banto_image_digest` takes, and why the summary prints it.
 
 ## Building the image
 
@@ -1123,10 +918,12 @@ bunx @sakajunquality/bunko@0.7.0 build . --push=false --oci-layout ./.oci --repo
 `docs/build-report.json`. It reads `.oci-report.json` by name, so keep the
 `--report` path if you run the two steps separately.
 
-To deploy you need the image in a registry and an immutable reference to it,
-because the Terraform above takes one as `var.banto_image`. Publishing is
-bunko's default, so drop `--push=false` and give it a repository prefix — the
-name comes from `bunko.imageName` in `package.json`:
+To deploy you need the image in a registry and an immutable reference to it.
+Building your own means bypassing the ghcr.io proxy in `examples/terraform`
+altogether: point `local.banto_image` at your own registry path instead of
+assembling it from `var.banto_image_digest`. Publishing is bunko's default,
+so drop `--push=false` and give it a repository prefix — the name comes from
+`bunko.imageName` in `package.json`:
 
 ```sh
 gcloud auth configure-docker asia-northeast1-docker.pkg.dev
@@ -1134,7 +931,8 @@ bunx @sakajunquality/bunko@0.7.0 build . \
   --repo asia-northeast1-docker.pkg.dev/my-runners-prd/containers \
   --image-refs ./image-refs.txt
 
-# The digest-pinned reference to pass as var.banto_image.
+# The digest-pinned reference — this is what local.banto_image would be set
+# to directly, if you build your own instead of pulling the published one.
 cat ./image-refs.txt
 ```
 
