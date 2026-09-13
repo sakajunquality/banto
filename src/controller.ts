@@ -1,6 +1,6 @@
 import type { WorkerPoolClient } from "./cloudrun.ts";
 import { type Decision, decide, SUSTAINED_SHORTFALL_MS, trackStaffing, usableAnchor } from "./decide.ts";
-import type { GitHubClient } from "./github.ts";
+import type { GitHubClient, RateLimitState } from "./github.ts";
 import type { Logger } from "./log.ts";
 import { selectPool } from "./match.ts";
 import { type DemandStore, mutate, type MutateOptions } from "./store.ts";
@@ -82,6 +82,32 @@ export interface ReconcileResult {
 const TRIGGERING_ACTIONS = new Set(["queued", "in_progress", "completed"]);
 const DEFAULT_MIN_PASS_INTERVAL_MS = 10_000;
 
+/**
+ * How long a configured pool may go without matching a single job before that
+ * is worth a line above DEBUG.
+ *
+ * There is no test that separates "these labels no longer match anything a
+ * workflow asks for" from "this pool is genuinely quiet right now" — a
+ * nightly-only pool can go a full day without demand and be exactly as healthy
+ * as one whose selector drifted from every runner_labels it was meant to
+ * cover. A day is chosen to sit comfortably above ordinary quiet, not because
+ * it is known to separate the two cases; picking it only trades detection
+ * latency against how often this fires on a pool that is working exactly as
+ * configured. That is why it lands at WARNING and not ERROR: banto cannot
+ * confirm the failure, only report the absence.
+ */
+export const POOL_NO_MATCH_WARNING_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Remaining-budget fractions that promote the once-per-reconcile budget
+ * report above routine detail. Mirrors the staffing alarm's shape: ordinary
+ * is quiet, tight is worth a look, and empty enough to plausibly hit zero
+ * before the hourly window resets is the same practical failure as a staffing
+ * outage — no pool can be scaled up — so it gets the same ERROR tier.
+ */
+export const BUDGET_WARNING_REMAINING_FRACTION = 0.2;
+export const BUDGET_ERROR_REMAINING_FRACTION = 0.05;
+
 interface PoolRuns {
   /** The pass currently running. */
   current: Promise<Decision>;
@@ -94,10 +120,26 @@ export class Controller {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly runs = new Map<string, PoolRuns>();
   private readonly lastPassAt = new Map<string, number>();
+  /**
+   * The last time each pool's own pass saw *any* job attributed to it, kept in
+   * memory rather than in `PoolState`. It only ever widens a WARNING window
+   * by however long a restart has been up, never a scaling decision — unlike
+   * `lastBusyAt`, nothing here is read by `decide()` — so losing it costs a
+   * delayed report, not a wrong count. That is not worth a third stored value
+   * and the schema change that would come with it.
+   */
+  private readonly lastMatchedAt = new Map<string, number>();
+  /** Per-signature counts of jobs no configured pool claimed, since the last report. */
+  private readonly unmatchedJobLabelCounts = new Map<string, number>();
+  /** What `reportBudget` last printed, so it can report a delta rather than a bare snapshot. */
+  private lastReportedRateLimit: RateLimitState | null = null;
 
   constructor(private readonly deps: ControllerDeps) {
     this.minPassIntervalMs = deps.minPassIntervalMs ?? DEFAULT_MIN_PASS_INTERVAL_MS;
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    // Unknown history reads as "matched just now": a fresh process should not
+    // spend its first day's worth of passes accusing every pool of drift.
+    for (const pool of deps.pools) this.lastMatchedAt.set(pool.name, deps.clock.now());
   }
 
   async handleWorkflowJob(event: WorkflowJobEvent): Promise<EventOutcome> {
@@ -111,7 +153,12 @@ export class Controller {
     const labels = event.workflow_job?.labels ?? [];
     const pool = selectPool(this.deps.pools, labels);
     if (!pool) {
+      // Left at DEBUG per event on purpose: most installations see this for
+      // every GitHub-hosted job (`ubuntu-latest` and friends) alongside any
+      // real drift, and there is no way to tell the two apart from one event.
+      // `reportUnmatchedJobs` is where a *pattern* becomes visible instead.
       this.deps.logger.debug("no pool matches job labels", { labels });
+      this.recordUnmatchedJob(labels);
       return { handled: false, reason: "no_matching_pool" };
     }
 
@@ -144,6 +191,12 @@ export class Controller {
         this.deps.logger.error("pass failed for pool", { pool: pool.name, error: message });
       }
     }
+    // Both of these summarise across every pool's passes above, so they are
+    // reported once per sweep rather than once per pool — see each method's
+    // own comment for why reporting them from inside a single pool's pass
+    // would multiply the same installation-wide fact by the pool count.
+    this.reportBudget();
+    this.reportUnmatchedJobs();
     return { decisions, failures, evidenceComplete };
   }
 
@@ -204,6 +257,7 @@ export class Controller {
     const runners = evidence.kind === "complete" ? evidence.runners : null;
     const staffing = trackStaffing((await this.deps.store.get(pool.name)).state, instanceCount, runners, at);
     this.reportStaffing(pool, instanceCount, runners, staffing);
+    this.reportPoolMatch(pool, evidence, at);
 
     // Recorded *before* the scaling write, and a failure here fails the pass.
     // The alternative — write first, record after — loses the record of a busy
@@ -368,6 +422,131 @@ export class Controller {
       });
     } else {
       this.deps.logger.info("pool instances not yet registered as runners", fields);
+    }
+  }
+
+  /**
+   * The other half of the runner cross-check's blind spot: a pool whose
+   * selector never matches a job at all looked, from the logs, identical to a
+   * healthy pool with no work — a 200 for every webhook, no error, no
+   * counter. That is precisely how five pools' worth of drifted labels went
+   * unnoticed until the pool list was extended (see the README).
+   *
+   * `evidence.demand` is recomputed from scratch every pass, so "matched
+   * nothing" here means this pass, not "since forever" — the duration is
+   * carried by `lastMatchedAt`, not by anything this function remembers
+   * between calls.
+   */
+  private reportPoolMatch(pool: PoolConfig, evidence: PoolEvidence, at: number): void {
+    // Partial evidence reports whatever demand it managed to count, which is
+    // 0 when the listing failed outright — and 0 there means "banto could not
+    // finish looking", not "there was nothing to find". Letting that advance
+    // the window would blame a drifted selector for an outage, and would do it
+    // during the outage, when the operator has enough to read already. The
+    // anchor is moved rather than held so the window measures an unbroken run
+    // of passes that actually looked; the same reasoning `decide` uses when it
+    // refuses to lower a count on evidence it does not trust.
+    if (evidence.kind !== "complete" || evidence.demand > 0) {
+      this.lastMatchedAt.set(pool.name, at);
+      return;
+    }
+    const last = this.lastMatchedAt.get(pool.name) ?? at;
+    const idleFor = Math.max(0, at - last);
+    if (idleFor < POOL_NO_MATCH_WARNING_MS) return;
+    // Deliberately not distinguishing "labels drifted" from "no traffic today"
+    // — see POOL_NO_MATCH_WARNING_MS. Either way, the operator now has
+    // something to check that used to be indistinguishable from silence.
+    this.deps.logger.warn("pool has matched no job in an extended window", {
+      pool: pool.name,
+      labels: pool.labels,
+      idleForSeconds: Math.floor(idleFor / 1000),
+    });
+  }
+
+  /** Signature a job's labels are grouped by, so repeats of the same set count as one thing. */
+  private recordUnmatchedJob(labels: readonly string[]): void {
+    const key = [...new Set(labels.map((l) => l.toLowerCase()))].sort().join(",");
+    this.unmatchedJobLabelCounts.set(key, (this.unmatchedJobLabelCounts.get(key) ?? 0) + 1);
+  }
+
+  /**
+   * Summarise, once per reconcile sweep, the deliveries `handleWorkflowJob`
+   * could not attribute to any pool since the last summary.
+   *
+   * Only webhook deliveries feed this, not the job listings each pool's own
+   * pass fetches during `reconcile`: those are already filtered per pool (see
+   * `gatherEvidence`), fetched once per pool rather than once for the whole
+   * installation, and not shared between pools on purpose (see "Reconcile" in
+   * the README) — folding them in here would either double-count a job every
+   * pool's listing happened to include, or require gathering an installation-
+   * wide listing this design deliberately does not take.
+   *
+   * This is intentionally left at INFO regardless of volume. Most
+   * installations route jobs that were never meant for a self-hosted pool
+   * through the same webhook (`ubuntu-latest` and the like — see the test
+   * fixture in controller.test.ts), so a high count on its own does not mean
+   * anything is wrong; only a human who knows their own workflows can tell a
+   * drifted pool selector from ordinary GitHub-hosted traffic. Escalating this
+   * on count or persistence alone would be a warning that cries wolf on every
+   * installation that runs both kinds of job, which is most of them.
+   */
+  private reportUnmatchedJobs(): void {
+    if (this.unmatchedJobLabelCounts.size === 0) return;
+    const bySignature = [...this.unmatchedJobLabelCounts.entries()]
+      .map(([labels, count]) => ({ labels, count }))
+      .sort((a, b) => b.count - a.count);
+    const total = bySignature.reduce((sum, entry) => sum + entry.count, 0);
+    this.deps.logger.info("jobs matched no configured pool since the last reconcile", {
+      total,
+      distinctLabelSets: bySignature.length,
+      bySignature,
+    });
+    this.unmatchedJobLabelCounts.clear();
+  }
+
+  /**
+   * Surface the installation's GitHub API budget once per reconcile sweep.
+   *
+   * `github.rateLimit()` reflects whichever call across *every* pool happened
+   * to land last — there is exactly one `GitHubClient` for the whole process
+   * (see main.ts), so the counter is already installation-wide before this
+   * function ever runs. Reading it from each pool's own pass would print the
+   * same shared number once per pool, which is the exact failure this exists
+   * to fix: an operator having to multiply by pool count instead of banto
+   * just saying the number.
+   *
+   * The delta is against the last time this function printed anything, not
+   * against the start of this sweep: webhook-triggered passes between two
+   * reconciles spend the same shared budget and belong in the same figure.
+   */
+  private reportBudget(): void {
+    const rateLimit = this.deps.github.rateLimit();
+    if (rateLimit === null || rateLimit.limit <= 0) return; // nothing observed yet
+    const { remaining, limit, resetAt } = rateLimit;
+    const fraction = remaining / limit;
+    const previous = this.lastReportedRateLimit;
+    // A delta only means "spent" within one hourly window: once resetAt moves,
+    // remaining legitimately jumps back up, and reporting that as consumption
+    // would read as banto regaining budget it never lost.
+    const consumedSincePreviousReport =
+      previous !== null && previous.resetAt === resetAt ? Math.max(0, previous.remaining - remaining) : null;
+    this.lastReportedRateLimit = rateLimit;
+
+    const fields = {
+      remaining,
+      limit,
+      percentRemaining: Math.round(fraction * 1000) / 10,
+      resetAt: new Date(resetAt).toISOString(),
+      ...(consumedSincePreviousReport === null ? {} : { consumedSincePreviousReport }),
+    };
+    if (fraction <= BUDGET_ERROR_REMAINING_FRACTION) {
+      // Same tier as the staffing alarm, because it is the same practical
+      // failure: nothing can be scaled up until the window resets.
+      this.deps.logger.error("GitHub API budget is nearly exhausted", fields);
+    } else if (fraction <= BUDGET_WARNING_REMAINING_FRACTION) {
+      this.deps.logger.warn("GitHub API budget is running low", fields);
+    } else {
+      this.deps.logger.debug("GitHub API budget", fields);
     }
   }
 }

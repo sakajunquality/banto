@@ -330,10 +330,34 @@ Three knobs, in the order they help:
 - **Fewer pools per deployment**, since each pool runs its own passes.
 
 Work out `passes_per_hour x calls_per_pass x pools` against your installation's
-limit and leave headroom. banto logs a warning when the remaining budget drops
-below a tenth of the limit, and exhaustion degrades safely: listings fail, the
-evidence is partial, and no pool is scaled down — though none is scaled up
-either, which is the failure you are budgeting to avoid.
+limit and leave headroom, or read it off the logs instead of computing it: every
+`x-ratelimit-*` header banto sees updates one shared counter — there is exactly
+one GitHub client for the whole process, however many pools are configured —
+and once per reconcile sweep banto reports what it says:
+
+```json
+{"severity":"DEBUG","message":"GitHub API budget","remaining":3120,"limit":5000,"percentRemaining":62.4,"resetAt":"2026-09-13T15:00:00.000Z","consumedSincePreviousReport":420}
+{"severity":"WARNING","message":"GitHub API budget is running low","remaining":850,"limit":5000,"percentRemaining":17,"resetAt":"2026-09-13T15:00:00.000Z"}
+{"severity":"ERROR","message":"GitHub API budget is nearly exhausted","remaining":120,"limit":5000,"percentRemaining":2.4,"resetAt":"2026-09-13T15:00:00.000Z"}
+```
+
+`consumedSincePreviousReport` is the delta against the last time this printed
+anything, not against the start of this sweep — a webhook-triggered pass
+between two reconciles spends the same shared budget and belongs in the same
+figure — and it is omitted once the hourly window rolls over, so a reset is
+never misread as budget regained. The severity mirrors the staffing alarm's
+shape on purpose: routine is DEBUG, tight enough to look at is WARNING at 20%
+remaining, and close enough to plausibly hit zero before the window resets is
+ERROR at 5% — the same practical failure as a staffing outage, since nothing
+can be scaled up either way. This is reported once per reconcile regardless of
+how many pools are configured, not once per pool: the counter is already
+installation-wide, so printing it from inside each pool's own pass would
+multiply one shared number by the pool count instead of just stating it.
+
+Exhaustion itself still degrades safely regardless of whether anyone is
+watching the logs: listings fail, the evidence is partial, and no pool is
+scaled down — though none is scaled up either, which is the failure you are
+budgeting to avoid.
 
 ## Running as a single instance
 
@@ -397,6 +421,61 @@ pass on either side recomputes from GitHub and corrects it. The guarantee is:
 `blocked_incomplete_evidence`, `blocked_in_progress`, `blocked_runner_busy`,
 `blocked_cooldown`. `idleEvidence` says what allowed a scale-down: `runners`
 (GitHub said the pool's online runners were all idle) or `cooldown`.
+
+**A configured pool that never matches a job looks, in the logs, exactly like a
+healthy idle one** — a 200 for every webhook, no error, no counter. That was
+true right up until it wasn't: five pools' worth of drifted labels went
+unnoticed this way until the symptom (scaling decisions only ever appearing at
+reconcile time, never from a webhook) was tracked down by hand. Each pool's
+pass now remembers how long it has been since it last matched anything at all,
+and says so once that has gone on for a day:
+
+```json
+{"severity":"WARNING","message":"pool has matched no job in an extended window","pool":"build","labels":["self-hosted","runner-build"],"idleForSeconds":90000}
+```
+
+A day is deliberately long. banto cannot tell "these labels drifted from the
+runner pool's real `runner_labels`" apart from "this pool genuinely has no
+traffic today" — a nightly-only pool is exactly as healthy as a broken one by
+this measure — so the threshold is chosen to sit above ordinary quiet rather
+than to prove drift, and the line lands at WARNING rather than ERROR because
+banto is reporting an absence, not a confirmed failure.
+
+Only passes that gathered complete evidence count toward the window. A partial
+pass reports whatever demand it managed to count, which is zero when the
+listing failed outright — and zero there means banto could not finish looking,
+not that there was nothing to find. Letting that advance the window would blame
+a drifted selector for an outage, and would do it during the outage. A pool
+whose listings stay partial therefore never reaches the warning, which is the
+honest answer: nothing established that it matched nothing.
+
+The window is tracked in memory, not in the store (see [State](#state)): a
+restart costs a delayed report, never a wrong scaling decision, so it was not
+worth a third persisted value.
+
+**The other direction — a job whose labels match no configured pool at all —**
+is logged at DEBUG per event, unchanged, because most installations see this
+constantly for ordinary GitHub-hosted jobs (`ubuntu-latest` and the like)
+alongside anything that might be real drift, and a single event cannot tell
+the two apart. What is new is a summary once per reconcile sweep, of what
+arrived and matched nothing since the last one:
+
+```json
+{"severity":"INFO","message":"jobs matched no configured pool since the last reconcile","total":9,"distinctLabelSets":3,"bySignature":[{"labels":"windows-latest","count":5},{"labels":"ubuntu-latest","count":2},{"labels":"runner-ghost,self-hosted","count":2}]}
+```
+
+This stays at INFO regardless of the count: a high number on its own is not a
+problem on an installation that also runs GitHub-hosted jobs through the same
+webhook, and only a human who knows their own workflows can tell a drifted
+pool selector from ordinary traffic. Escalating this on volume or persistence
+alone would be a warning that cries wolf on most installations, so it does
+not try — it only makes the pattern visible where before there was nothing
+above DEBUG to notice it by. Only webhook deliveries feed this count, not the
+job listings each pool's own pass fetches: those are already scoped per pool
+and fetched once per pool rather than once for the installation (see
+[Reconcile](#reconcile)), so folding them in here would either double-count a
+job several pools' listings happened to include, or require an installation-
+wide listing this design deliberately does not take.
 
 Secrets are kept out of the logs deliberately, though this is a discipline
 rather than a guarantee the type system enforces: no token, signature or private
@@ -476,6 +555,15 @@ Everything else a decision needs is read in the pass that uses it. The instance
 count comes from Cloud Run, demand and runners come from GitHub. That is what
 makes the store this small, and it is the same reason there are no merge rules
 to get wrong.
+
+The controller separately keeps a little bookkeeping **in memory, not in the
+store**, purely to know what to log: how long it has been since a pool last
+matched a job (see [Observability](#observability)), a running tally of jobs
+that matched no pool, and the last GitHub rate-limit reading it printed. None
+of it is read by `decide()`, so losing it on a restart costs a delayed or
+reset report, never a wrong scaling decision — which is the bar a third stored
+value would have to clear, and this bookkeeping does not, so it stays out of
+the store and out of the schema.
 
 The store is behind a small interface with optimistic concurrency:
 
