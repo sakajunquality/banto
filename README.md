@@ -1,27 +1,64 @@
 # banto
 
-**banto** (番頭 — the head clerk who staffs a shop as trade demands) keeps a
-[Cloud Run worker pool](https://cloud.google.com/run/docs/deploy-worker-pools)
-staffed with ephemeral GitHub Actions self-hosted runners. It listens to
-`workflow_job` webhooks, counts the jobs that want each pool, and moves the
-pool's `manualInstanceCount` to match.
+**banto** (番頭 — the head clerk who staffs a shop as trade demands) runs
+ephemeral GitHub Actions self-hosted runners on Cloud Run. It listens to
+`workflow_job` webhooks and computes fresh demand, without Kubernetes or an
+always-running queue listener.
 
-Automatic scale-down is disabled by default to protect running jobs. Capacity
-can grow but is retained after work finishes. Opt into `scaleDown: "idle"` only
-if the [documented interruption risk](#the-scale-down-hazard) is acceptable.
+- **`jobs` (new, opt-in):** one Cloud Run execution per JIT runner. Start from
+  zero, launch for demand, and return to zero through individual completion.
+  Reduced demand never cancels a running execution. See [serverless runners](#serverless-runners).
+- **`worker-pool` (existing default):** adjust `manualInstanceCount` on a
+  [worker pool](https://cloud.google.com/run/docs/deploy-worker-pools).
+  Automatic scale-down is disabled by default and capacity stays billed.
+  `scaleDown: "idle"` opts into [observation-based mitigation and its risk](#the-scale-down-hazard).
 
 It is a single Bun process with one runtime dependency (Hono), deployed as a
 container built with [bunko](https://github.com/sakajunquality/bunko). It must
-run as **exactly one instance** — see
+have **at most one active controller** — see
 [why](#running-as-a-single-instance).
 
 ```
 GitHub ──workflow_job──▶ POST /webhook ─┐
-                                        ├─▶ demand per pool (GCS) ─▶ Cloud Run Admin API
-Cloud Scheduler ─OIDC──▶ POST /reconcile┘      (manualInstanceCount)
+                                        ├─▶ fresh GitHub demand ─▶ Cloud Run Admin API
+Cloud Scheduler ─OIDC──▶ POST /reconcile┘       durable state (GCS / Firestore)
 ```
 
+## Serverless runners
+
+The `jobs` backend targets small, intermittent workloads: no warm runner
+capacity, no cluster, and a request-driven controller that can scale to zero.
+Each launch reserves a durable slot, receives one-job JIT credentials, and runs
+one task with platform retries disabled. GitHub demand controls admission;
+Cloud Run execution completion controls retirement. A short job finishing
+cannot evict a sibling running a long job.
+
+```json
+[{"name":"jobs-default","backend":"jobs","project":"my-runners-prd",
+  "location":"us-central1","job":"banto-runner",
+  "labels":["self-hosted","banto-jobs"],"max":3,
+  "min":0,"warmSpare":0,"idleTimeoutSeconds":120}]
+```
+
+Start with the [runner image](runner/README.md) and
+[standalone Terraform example](examples/terraform-jobs/README.md). The controller
+needs a durable store and JIT registration permissions; runners receive neither
+the App private key nor controller IAM permissions. Build this branch rather
+than using an older published controller image.
+
+This is experimental, not ARC parity. An unused runner exits after its idle
+deadline, but assignment can race the job-start hook; the task timeout can also
+interrupt a busy runner. An ambiguous launch retains its slot until positively
+identified, sometimes requiring operator recovery. Jobs have a one-minute
+minimum charge; scheduler, storage, logs, and network costs remain at zero
+runner capacity. Read the [design, cost model, and limitations](docs/runner-retirement.md)
+before choosing workloads. Local tests are not a live-cloud integration claim.
+
 ## Why this exists
+
+The original worker-pool backend motivated this project. The following scaling
+and cross-check sections describe that backend unless explicitly stated otherwise;
+the jobs lifecycle is documented above and in the design.
 
 A Cloud Run worker pool does not scale itself. The v2 API's scaling settings
 for a worker pool are a single field, `manualInstanceCount` — there is no
@@ -49,7 +86,7 @@ because it is the thing that can see the queue.
 
 ## How it works
 
-A **pass** is the unit of work, and it is stateless:
+A **pass** is the unit of work. For worker pools:
 
 1. Ask GitHub what is queued and running for this pool right now.
 2. Ask GitHub which runners are registered for it and whether any is busy.
@@ -225,8 +262,8 @@ Available mitigations include:
 
 If automatic capacity reclamation must also avoid intentionally interrupting
 jobs, use an execution architecture with individual runner lifecycles. The
-[design investigation](docs/runner-retirement.md#alternative-execution-architecture)
-describes that alternative and the requirements for a pool-wide barrier.
+[serverless jobs implementation](docs/runner-retirement.md)
+provides individual lifecycles and describes the remaining admission race.
 
 ## Reconcile
 
@@ -388,8 +425,13 @@ budgeting to avoid.
 
 ## Running as a single instance
 
-**banto must be deployed as one instance**, and the reason is worth stating
+**banto must have at most one active controller**, and the reason is worth stating
 because the obvious alternative looks like it should work.
+
+The jobs example permits zero controller instances between requests. Durable
+reservations survive cold starts. Keep a single serving revision and dedicated
+job; CAS bounds reservations but is not a general distributed-controller protocol.
+The aggregate-write hazards below apply specifically to worker pools.
 
 Two instances would need to agree on who may write a pool's instance count. A
 distributed lock is the usual answer, and it buys nothing here: a lock is only as
@@ -448,6 +490,8 @@ pass on either side recomputes from GitHub and corrects it. The guarantee is:
 `blocked_incomplete_evidence`, `blocked_in_progress`, `blocked_runner_busy`,
 `blocked_cooldown`, `blocked_scale_down_disabled`. `idleEvidence` is now `cooldown` for every scale-down;
 older releases also emitted `runners` for the removed idle-runner shortcut.
+The jobs backend also emits `blocked_launch_backoff` and `awaiting_completion`,
+with `backend: "jobs"`, reservation count, and started/retired counts.
 
 **A configured pool that never matches a job looks, in the logs, exactly like a
 healthy idle one** — a 200 for every webhook, no error, no counter. That was
@@ -569,8 +613,8 @@ bucket are two permanent concurrent appliers, which is exactly what
 
 ## State
 
-banto persists two numbers per pool, and only because they cannot be recomputed
-from a single observation:
+Worker pools persist two timestamps because they cannot be recomputed from a
+single observation:
 
 - `lastBusyAt` — when a pass last saw work, a busy runner, or incomplete evidence. The
   idle cooldown counts from it, and no API call answers "when was this pool last
@@ -578,7 +622,13 @@ from a single observation:
 - `shortfallSince` — when instances first outnumbered online runners and have
   ever since. That is a duration across passes, not a fact about one.
 
-Everything else a decision needs is read in the pass that uses it. The instance
+Jobs pools additionally persist `executions`: launch IDs, creation times,
+registration IDs, operation/execution names, and failure backoff. These are
+ownership reservations, not cached GitHub demand. The state never contains JIT
+credentials. Losing it can duplicate paid launches, so jobs reject the memory
+store. Do not clear or rename an active pool's state to recover an unknown run.
+
+Everything else a worker-pool decision needs is read in the pass that uses it. The instance
 count comes from Cloud Run, demand and runners come from GitHub. That is what
 makes the store this small, and it is the same reason there are no merge rules
 to get wrong.
@@ -588,8 +638,7 @@ store**, purely to know what to log: how long it has been since a pool last
 matched a job (see [Observability](#observability)), a running tally of jobs
 that matched no pool, and the last GitHub rate-limit reading it printed. None
 of it is read by `decide()`, so losing it on a restart costs a delayed or
-reset report, never a wrong scaling decision — which is the bar a third stored
-value would have to clear, and this bookkeeping does not, so it stays out of
+reset report, never a wrong scaling decision. This bookkeeping stays out of
 the store and out of the schema.
 
 The store is behind a small interface with optimistic concurrency:
@@ -621,13 +670,15 @@ a tagged revision taking traffic. In the intended steady state there is one
 writer, by deployment requirement.
 
 **Why GCS is the default.** The honest trade is that Firestore is a little
-faster per operation and GCS is far easier to provision. banto writes two
-numbers per pass, so the latency difference does not show up in anything an
+faster per operation and GCS is far easier to provision. Worker pools write two
+timestamps per pass, so the latency difference does not show up in anything an
 operator would notice; the provisioning difference does. "Create a bucket" is
 one resource anyone can add to an existing project. Enabling Firestore is a
 project-level decision with a database mode attached to it, in a project that
 may already have made a different one. Both are supported and the code above the
 store cannot tell which one it is talking to.
+Jobs perform multiple reservation writes per launch and retain outstanding
+launch metadata; include those operations in the control-plane cost estimate.
 
 ## Configuration
 
@@ -664,17 +715,28 @@ Each entry of `BANTO_POOLS`:
 
 | Field | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `project` | yes | — | Project **id** of the worker pool (not a project number) |
+| `project` | yes | — | Project **id** of the Cloud Run resource (not a project number) |
 | `location` | yes | — | Region, e.g. `asia-northeast1` |
-| `workerPool` | yes | — | Worker pool short name (not a path or full resource name) |
+| `backend` | no | `"worker-pool"` | `"worker-pool"` or `"jobs"` |
+| `workerPool` | for worker pools | — | Worker pool short name (not a path or full resource name) |
+| `job` | for jobs | — | Dedicated Cloud Run Job short name; cannot be combined with `workerPool` |
+| `runnerGroupId` | no | `1` | Jobs: GitHub runner group ID used for JIT registration |
+| `idleTimeoutSeconds` | no | `120` | Jobs: unused-runner deadline, 1–3600 seconds |
 | `labels` | yes | — | Label selector; all must be present on a job |
 | `max` | yes | — | Ceiling on instances |
 | `min` | no | `0` | Floor on instances, busy or idle |
 | `warmSpare` | no | `0` | Idle instances kept *on top of* current demand |
-| `name` | no | `workerPool` | Logical name; also the storage key, so letters, digits, `.`, `-`, `_` only |
+| `name` | no | `workerPool` or `job` | Logical name; also the storage key, so letters, digits, `.`, `-`, `_` only |
 | `cooldownSeconds` | no | `300` | Required quiet-period grace before every scale-down (0 disables the grace) |
 | `scaleDown` | no | `"disabled"` | Prevents downward requests while allowing scale-up; explicitly select `"idle"` to accept observation-based mitigation and its interruption risk |
 | `runnerRepo` | no | — | `owner/repo` this pool's runners register to; unset means "cross-check against `GITHUB_ORG`" |
+
+Jobs require `min: 0`, `warmSpare: 0`, GCS or Firestore, and a registration scope
+(`runnerRepo` or `GITHUB_ORG`). They reject `scaleDown`; `cooldownSeconds` is
+worker-pool-only. For jobs, `max` bounds outstanding reservations, not a spending
+budget, and `runnerRepo` selects JIT creation/cleanup scope rather than a busy
+cross-check. Use labels and repository/runner-group access that agree with that
+scope; a repo-scoped runner cannot serve demand from another repository.
 
 **A pool's address must mean exactly what it says.** The three components are
 interpolated into a Cloud Run resource path *and* compared between pools to

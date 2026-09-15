@@ -1,12 +1,42 @@
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import { GitHubAppClient, isSafeRepoName } from "../src/github.ts";
+import { pool } from "./helpers.ts";
 
 const PEM = generateKeyPairSync("rsa", { modulusLength: 2048 })
   .privateKey.export({ type: "pkcs8", format: "pem" })
   .toString();
 
 const NOW = 1_700_000_000_000;
+
+describe("one-job runner credentials", () => {
+  for (const repo of [undefined, "example-org/infra"]) {
+    test(`JIT registration and cleanup use the ${repo ? "repository" : "organization"} scope`, async () => {
+      const calls: { path: string; method: string | undefined; body: unknown }[] = [];
+      const github = new GitHubAppClient({ appId: "1", installationId: "2", privateKey: PEM, org: "example-org",
+        now: () => NOW, fetchImpl: async (input, init) => {
+          const path = new URL(String(input)).pathname;
+          if (path.endsWith("/access_tokens")) return Response.json({ token: "installation", expires_at: new Date(NOW + 3_600_000).toISOString() });
+          calls.push({ path, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : null });
+          if (init?.method === "DELETE") return new Response(null, { status: 404 });
+          return Response.json({ runner: { id: 42 }, encoded_jit_config: "one-job-secret" });
+        } });
+      const config = pool({ ...(repo ? { runnerRepo: repo } : {}), runnerGroupId: 7 });
+      expect(await github.createJitRunner(config, "banto-test")).toEqual({ runnerId: 42, config: "one-job-secret" });
+      await github.removeRunner(config, 42);
+      const root = repo ? `/repos/${repo}` : "/orgs/example-org";
+      expect(calls[0]).toEqual({ path: `${root}/actions/runners/generate-jitconfig`, method: "POST",
+        body: { name: "banto-test", runner_group_id: 7, labels: config.labels, work_folder: "_work" } });
+      expect(calls[1]?.path).toBe(`${root}/actions/runners/42`);
+    });
+  }
+  test("a malformed credential response does not leak its contents", async () => {
+    const github = new GitHubAppClient({ appId: "1", installationId: "2", privateKey: PEM, org: "example-org",
+      now: () => NOW, fetchImpl: async (input) => String(input).includes("access_tokens") ?
+        Response.json({ token: "token" }) : new Response("sensitive-credential") });
+    await expect(github.createJitRunner(pool(), "test")).rejects.toThrow("returned a body that is not JSON");
+  });
+});
 
 interface Route {
   runs?: Record<string, { id: number }[]>;

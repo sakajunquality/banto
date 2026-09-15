@@ -1,4 +1,6 @@
 import { CloudRunWorkerPoolClient } from "./cloudrun.ts";
+import { CloudRunJobsClient } from "./cloudrun-jobs.ts";
+import { ExecutionScaler } from "./executions.ts";
 import { type BantoConfig, ConfigError, loadConfig } from "./config.ts";
 import { Controller } from "./controller.ts";
 import { FirestoreDemandStore } from "./firestore.ts";
@@ -52,19 +54,23 @@ if (config.store === "memory") {
   logger.warn("using the in-memory demand store: state is lost on restart and wrong with more than one instance");
 }
 
+const github = new GitHubAppClient({
+  appId: config.github.appId,
+  installationId: config.github.installationId,
+  privateKey: config.github.privateKey,
+  repos: config.github.repos,
+  org: config.github.org,
+  maxPagesPerQuery: config.maxPagesPerQuery,
+  logger,
+});
+
 const controller = new Controller({
   pools: config.pools,
   store,
   workerPools: new CloudRunWorkerPoolClient(tokens),
-  github: new GitHubAppClient({
-    appId: config.github.appId,
-    installationId: config.github.installationId,
-    privateKey: config.github.privateKey,
-    repos: config.github.repos,
-    org: config.github.org,
-    maxPagesPerQuery: config.maxPagesPerQuery,
-    logger,
-  }),
+  executions: new ExecutionScaler({ store, client: new CloudRunJobsClient(tokens, fetch, config.maxPagesPerQuery),
+    registrar: github, clock: systemClock, logger }),
+  github,
   clock: systemClock,
   logger,
   minPassIntervalMs: config.minPassIntervalMs,
@@ -88,6 +94,8 @@ logger.info("banto starting", {
   minPassIntervalSeconds: config.minPassIntervalMs / 1000,
   pools: config.pools.map((pool) => ({
     name: pool.name,
+    backend: pool.backend ?? "worker-pool",
+    job: pool.job,
     workerPool: pool.workerPool,
     location: pool.location,
     labels: pool.labels,
@@ -95,6 +103,8 @@ logger.info("banto starting", {
     max: pool.max,
     warmSpare: pool.warmSpare,
     cooldownSeconds: pool.cooldownSeconds,
+    scaleDown: pool.scaleDown,
+    idleTimeoutSeconds: pool.idleTimeoutSeconds,
   })),
 });
 

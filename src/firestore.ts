@@ -3,6 +3,7 @@ import { expectJson, HttpError, httpRequest } from "./http.ts";
 import { ConcurrencyError, type DemandStore, type VersionedState } from "./store.ts";
 import type { Fetcher, PoolState } from "./types.ts";
 import { emptyPoolState } from "./types.ts";
+import { readExecutionState } from "./launch-state.ts";
 
 /**
  * Firestore-backed demand state over the REST API.
@@ -131,6 +132,7 @@ export function encodeState(state: PoolState): Record<string, FirestoreValue> {
   return {
     lastBusyAt: nullableInt(state.lastBusyAt ?? null),
     shortfallSince: nullableInt(state.shortfallSince ?? null),
+    ...(state.executions === undefined ? {} : { executions: { stringValue: JSON.stringify(state.executions) } }),
   };
 }
 
@@ -139,7 +141,16 @@ export function decodeState(fields: Record<string, FirestoreValue> | undefined):
   return {
     lastBusyAt: intOf(fields.lastBusyAt),
     shortfallSince: intOf(fields.shortfallSince),
+    ...(fields.executions === undefined ? {} : { executions: decodeExecutions(fields.executions) }),
   };
+}
+
+function decodeExecutions(field: FirestoreValue) {
+  if (!("stringValue" in field)) throw new Error("invalid execution launch state encoding");
+  let value: unknown;
+  try { value = JSON.parse(field.stringValue); }
+  catch { throw new Error("invalid execution launch state JSON"); }
+  return readExecutionState(value);
 }
 
 function nullableInt(value: number | null): FirestoreValue {

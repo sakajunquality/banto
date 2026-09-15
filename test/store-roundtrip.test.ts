@@ -29,10 +29,16 @@ type DeepRequired<T> = T extends (infer U)[]
 const SAMPLE: DeepRequired<PoolState> = {
   lastBusyAt: 1_700_000_003_000,
   shortfallSince: 1_700_000_004_000,
+  executions: {
+    launches: [{ id: "00000000-0000-4000-8000-000000000001", createdAt: 1_700_000_000_000,
+      runnerId: 1, notSubmitted: false, operation: "projects/test-project/locations/us-central1/operations/one",
+      execution: "projects/test-project/locations/us-central1/jobs/runner/executions/runner-one" }],
+    failures: 2, retryAfter: 1_700_000_030_000,
+  },
 };
 
 /** The field list, restated independently of the type, so a rename is caught. */
-const EXPECTED_FIELDS = ["lastBusyAt", "shortfallSince"];
+const EXPECTED_FIELDS = ["executions", "lastBusyAt", "shortfallSince"];
 
 /** An in-memory Firestore document, exercising the real REST codec. */
 function firestoreStore(): DemandStore {
