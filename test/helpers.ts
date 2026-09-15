@@ -134,6 +134,8 @@ export function pool(overrides: Partial<PoolConfig> = {}): PoolConfig {
     max: 5,
     warmSpare: 0,
     cooldownSeconds: 300,
+    // Legacy mitigation tests opt in; production defaults to no reductions.
+    scaleDown: "idle",
     ...overrides,
   };
 }

@@ -6,6 +6,10 @@ staffed with ephemeral GitHub Actions self-hosted runners. It listens to
 `workflow_job` webhooks, counts the jobs that want each pool, and moves the
 pool's `manualInstanceCount` to match.
 
+Automatic scale-down is disabled by default to protect running jobs. Capacity
+can grow but is retained after work finishes. Opt into `scaleDown: "idle"` only
+if the [documented interruption risk](#the-scale-down-hazard) is acceptable.
+
 It is a single Bun process with one runtime dependency (Hono), deployed as a
 container built with [bunko](https://github.com/sakajunquality/bunko). It must
 run as **exactly one instance** — see
@@ -123,44 +127,63 @@ delay is usually not where the time goes.
 
 ### Scaling down
 
-banto only scales a pool down when **all** of these hold:
+Each pool supports `scaleDown: "disabled"` (the default) or `"idle"`.
+`disabled` prevents banto from requesting any decrease, including from a count
+above `max`, while still allowing scale-up for demand or `min`. Capacity is
+retained and billed until retired through a separate operational procedure.
+Use this when controller-initiated interruption is unacceptable. It cannot
+undo an earlier accepted PATCH or prevent platform failures and external writes.
+
+**Upgrade behavior:** configurations written before this option existed now
+retain capacity. Explicitly set `scaleDown: "idle"` to keep the previous
+mitigation policy. This default changes cost and scale-to-zero behavior, not
+the configured scale-up bounds.
+
+In `idle` mode, banto only scales a pool down when **all** of these hold:
 
 - **The evidence is complete.** A listing that was truncated or could not be
   fetched may not lower a count.
 - **No job for this pool is running**, according to that listing.
 - **No runner for this pool is `busy`**, when the runner list is available. This
   is GitHub's own statement about the machines that would be stopped.
-- **Either** the runner list shows online runners for the pool with none of them
-  busy — direct evidence, so the pool comes down immediately — **or** the idle
-  cooldown has passed (`cooldownSeconds`, default 300) since the last pass in
-  which every instance was justified: demand at least matched the instance
-  count, or a runner was busy. A runner list with *no* online runners is not
-  evidence of idleness: that is the staffing-failure case, and it falls back to
-  the cooldown.
-
-  The anchor is "every instance was justified" rather than "there was any work"
-  for a reason found by an interleaving test: a pool with steady demand of three
-  and four instances would refresh its own anchor on every pass and could never
-  shed the fourth.
+- **The idle cooldown has passed** (`cooldownSeconds`, default 300). Online
+  idle runners do not bypass it. Any queued/running job, busy runner, or
+  incomplete observation restarts the anchor. With a positive cooldown, surplus
+  capacity is deliberately retained until work drains, including capacity above
+  `max` set by another actor. Setting the cooldown to zero opts out of this grace.
+- **A second fresh observation still permits the reduction.** Before a downward
+  PATCH, banto fetches jobs, runners and the worker-pool count again and records
+  that observation. New work or incomplete evidence cancels the reduction;
+  failures reading the pool or writing state fail the pass without shrinking.
 
 A missing or unreadable anchor — a failed state write, a corrupt value — reads
 as **busy just now**, not as busy never. The conservative direction costs one
 cooldown of capacity; the other direction scales a pool away on the strength of
 having no record of it.
 
+A failed pass can also leave an old, readable anchor behind. banto resets it
+on the next successfully recorded observation. Every controller startup does
+the same, because the previous process may have observed work without saving
+it. With a positive cooldown, recovery and restart therefore cost a fresh grace
+period; scale-up is still immediate. These are observation-based mitigations,
+not proof that the pool was continuously idle between polls.
+
 Read the next section before you set `min: 0` on anything that matters.
 
 ## The scale-down hazard
 
 **Reducing a worker pool's instance count can stop an instance that is running a
-job.** Cloud Run decides which instance to stop. It does not know that one of
-them is halfway through a test suite, and there is no drain: no way to say
-"retire this one when it goes idle", no per-instance addressing, nothing to mark
-an instance as ineligible.
+job.** Cloud Run decides which instance to stop. The
+[worker-pool scaling API](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.workerPools#WorkerPoolScaling)
+accepts an aggregate count, with no termination target or runner-drain
+acknowledgement. It cannot express "remove this retired runner and keep that
+busy runner". Cloud Run's separate Instances API is not a retirement selector
+for a worker pool's count update.
 
 What `--ephemeral` does and does not buy you is worth being precise about. It
-guarantees that a runner takes one job and deregisters afterwards, so a killed
-instance leaves no half-configured runner behind to pick up more work. It says
+guarantees that a runner takes one job and deregisters after processing it. It
+does not establish that an unused runner cannot accept its first job during
+scale-down, or that a killed runner's registration immediately disappears. It says
 nothing about how the interrupted job is reported: GitHub notices the runner is
 gone on its own schedule, and the job's failure can take minutes to surface. So
 the job is lost either way — the guarantee is about the *runner*, not about
@@ -172,27 +195,24 @@ banto's evidence is always at least a few seconds old: a runner that reported
 That window is small, it is not zero, and no amount of care on this side of the
 API can close it.
 
-**There is no runner-side fix either.** A runner that refuses to exit, or holds
+**Ignoring termination is not a drain protocol.** A runner that refuses to exit, or holds
 a lease while it works, does not survive a scale-down: Cloud Run sends `SIGTERM`
 and follows it with `SIGKILL` about ten seconds later, and an instance being
 removed is removed whatever the process inside it does. Ignoring the signal buys
-ten seconds, not a graceful finish. What actually helps is all on the
-configuration side:
+ten seconds, not a graceful finish. Coordinating admission with retirement needs a separate design; see
+[the coordinated-retirement design](docs/runner-retirement.md) for
+[Issue #7](https://github.com/sakajunquality/banto/issues/7).
+Available mitigations include:
 
-- **`min`** — banto never takes a pool below it, so a pipeline that cannot
-  tolerate a killed job should keep its capacity there and pay for it around the
-  clock.
-- **The runner cross-check**, which is what actually shortens this window. Read
-  the next point before relying on `cooldownSeconds` instead of it.
-- **A generous `cooldownSeconds`**, with a caveat worth stating plainly: the
-  cooldown's clock only restarts on a pass where *every* instance was
-  justified — demand at least matched the instance count, or a runner was seen
-  working. Without `runnerRepo` on the pool or `GITHUB_ORG` for the deployment
-  there are no runner observations, so a pool with three instances and one
-  running job never refreshes its anchor, and the cooldown can already have
-  elapsed by the time that job finishes. Raising `cooldownSeconds` does not
-  change that. It delays a shrink that follows a genuinely quiet period; it
-  does not delay one that follows a period of excess capacity.
+- **`scaleDown: "disabled"`** — prevents new downward requests by banto while
+  retaining scale-up. This is containment, with a continuing capacity cost.
+- **`min`** — a capacity floor, not protection for any particular instance.
+  A reduction from two to one can still terminate the busy runner.
+- **The runner cross-check** plus the mandatory cooldown and pre-PATCH
+  confirmation reduce the opportunity for stopping a newly busy runner.
+- **A generous `cooldownSeconds`** retains capacity between closely spaced jobs.
+  It now applies even when online runners report idle, and work or incomplete
+  evidence restarts it. It is a mitigation, not an admission barrier.
 - **Short jobs.** The exposure is proportional to how long a job runs: a
   four-minute job spends far less of its life eligible to be stopped than a
   forty-minute one.
@@ -203,8 +223,10 @@ configuration side:
   the job it was validating never ran — on a release pipeline that is worse than
   the failure it hides.
 
-If none of that is acceptable for a given workload, that workload wants a pool
-with `min` equal to its peak, and banto should not be scaling it at all.
+If automatic capacity reclamation must also avoid intentionally interrupting
+jobs, use an execution architecture with individual runner lifecycles. The
+[design investigation](docs/runner-retirement.md#alternative-execution-architecture)
+describes that alternative and the requirements for a pool-wide barrier.
 
 ## Reconcile
 
@@ -221,7 +243,8 @@ It does **not** share a listing between pools, even though the jobs API is not
 per-pool and one listing would answer for all of them. Anything shared would
 have to be fetched before the pools queued behind one another, and would then
 age while they waited — which is the bug class this design exists to remove. The
-cost is one listing per pool per reconcile, and it is accounted for below.
+cost is one observation per pool, plus a second for a proposed reduction,
+and it is accounted for below.
 
 The same rule holds for the runner listing, including when several pools
 declare the same `runnerRepo`: each pool's pass still asks that endpoint on its
@@ -272,7 +295,7 @@ the job queue cannot:
 
 - **Is anything actually running right now?** `busy` is reported per runner. A
   busy runner blocks a scale-down outright, and a pool whose online runners are
-  all idle licenses one without waiting out the cooldown.
+  all idle must still wait out the cooldown and pass the final confirmation.
 
 The observation is used by the pass that fetched it and is not kept afterwards.
 
@@ -290,6 +313,10 @@ What happens when it is missing depends on *why*:
   the check.
 
 ### What it costs, and the knobs that bound it
+
+A proposed scale-down performs two full observations rather than one, including
+a second worker-pool GET and state update. Budget up to twice the listing cost
+below on those passes. Scale-up and unchanged passes use one observation.
 
 Every pass fetches its own evidence — job listings, the runner listing and the
 Cloud Run count — after it has claimed the pool's slot and waited out the
@@ -413,14 +440,14 @@ pass on either side recomputes from GitHub and corrects it. The guarantee is:
 ```json
 {"severity":"INFO","message":"scaling decision","pool":"default","demand":2,"warmSpare":0,"current":1,"desired":2,"target":2,"outcome":"scale_up","wrote":true,"evidence":"complete","running":0}
 {"severity":"INFO","message":"scaling decision","pool":"default","demand":1,"warmSpare":0,"current":2,"desired":1,"target":2,"outcome":"blocked_in_progress","wrote":false,"evidence":"complete","running":1}
-{"severity":"INFO","message":"scaling decision","pool":"build","demand":0,"warmSpare":0,"current":1,"desired":0,"target":0,"outcome":"scale_down","wrote":true,"evidence":"complete","running":0,"runnersOnline":1,"runnersBusy":0,"idleEvidence":"runners"}
+{"severity":"INFO","message":"scaling decision","pool":"build","demand":0,"warmSpare":0,"current":1,"desired":0,"target":0,"outcome":"scale_down","wrote":true,"evidence":"complete","running":0,"runnersOnline":1,"runnersBusy":0,"idleEvidence":"cooldown"}
 {"severity":"INFO","message":"scaling decision","pool":"build","demand":0,"warmSpare":0,"current":1,"desired":0,"target":1,"outcome":"blocked_incomplete_evidence","wrote":false,"evidence":"partial","evidenceReason":"runner listing unavailable"}
 ```
 
 `outcome` is one of `scale_up`, `scale_down`, `unchanged`,
 `blocked_incomplete_evidence`, `blocked_in_progress`, `blocked_runner_busy`,
-`blocked_cooldown`. `idleEvidence` says what allowed a scale-down: `runners`
-(GitHub said the pool's online runners were all idle) or `cooldown`.
+`blocked_cooldown`, `blocked_scale_down_disabled`. `idleEvidence` is now `cooldown` for every scale-down;
+older releases also emitted `runners` for the removed idle-runner shortcut.
 
 **A configured pool that never matches a job looks, in the logs, exactly like a
 healthy idle one** — a 200 for every webhook, no error, no counter. That was
@@ -545,7 +572,7 @@ bucket are two permanent concurrent appliers, which is exactly what
 banto persists two numbers per pool, and only because they cannot be recomputed
 from a single observation:
 
-- `lastBusyAt` — when a pass last saw this pool with work or a busy runner. The
+- `lastBusyAt` — when a pass last saw work, a busy runner, or incomplete evidence. The
   idle cooldown counts from it, and no API call answers "when was this pool last
   busy".
 - `shortfallSince` — when instances first outnumbered online runners and have
@@ -645,7 +672,8 @@ Each entry of `BANTO_POOLS`:
 | `min` | no | `0` | Floor on instances, busy or idle |
 | `warmSpare` | no | `0` | Idle instances kept *on top of* current demand |
 | `name` | no | `workerPool` | Logical name; also the storage key, so letters, digits, `.`, `-`, `_` only |
-| `cooldownSeconds` | no | `300` | Idle cooldown before a scale-down, when the runner list is unavailable |
+| `cooldownSeconds` | no | `300` | Required quiet-period grace before every scale-down (0 disables the grace) |
+| `scaleDown` | no | `"disabled"` | Prevents downward requests while allowing scale-up; explicitly select `"idle"` to accept observation-based mitigation and its interruption risk |
 | `runnerRepo` | no | — | `owner/repo` this pool's runners register to; unset means "cross-check against `GITHUB_ORG`" |
 
 **A pool's address must mean exactly what it says.** The three components are
@@ -1022,19 +1050,11 @@ before changing anything:
   repository is workable — but only if the label sets are disjoint too, since
   two deployments watching different repositories can still be offered the same
   job labels.
-- **A pool above its own `max` is cut back to what demand justifies, capped at
-  `max`.** If something else set the count higher — a deploy, a human, or `max`
-  being lowered — banto brings it down to `clamp(demand + warmSpare, min, max)`
-  on the first pass where nothing is in progress and GitHub confirms the pool's
-  runners are idle. With little demand that is a cut to demand; with far more
-  work queued than `max` it is a cut to `max`. Either way queued work does not
-  hold the extra capacity: the surplus is released and the queue drains at
-  `max` width. Without runner evidence it is the other way
-  round, and permanently so: the idle cooldown restarts on any pass where
-  demand is at least the instance count, so a pool sitting above `max` with
-  more work queued than it has instances refreshes its own anchor forever and
-  is never cut back. Configure the runner cross-check, or fix an
-  over-provisioned pool by hand.
+- **With a positive cooldown, surplus capacity is retained while work remains.**
+  This includes a pool above `max` after an external change. Once work drains
+  and the cooldown elapses, banto converges to the configured idle count. `max`
+  still caps every scale-up. This trades extra capacity cost for fewer unsafe
+  reductions between jobs; it does not guarantee graceful termination.
 - **Each query reads at most `BANTO_MAX_PAGES_PER_QUERY` pages (default 5).**
   That is 500 runners in the org, 500 repositories in the installation, or 500
   active runs in one status for one repository. Past it the listing is

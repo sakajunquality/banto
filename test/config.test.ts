@@ -49,6 +49,7 @@ describe("configuration", () => {
     expect(config.firestore.database).toBe("(default)");
     expect(config.firestore.collection).toBe("banto-pools");
     expect(config.pools[0]?.cooldownSeconds).toBe(DEFAULT_COOLDOWN_SECONDS);
+    expect(config.pools[0]?.scaleDown).toBe("disabled");
     expect(config.minPassIntervalMs).toBe(10_000);
     expect(config.pools[0]?.labels).toEqual(["self-hosted", "runner-default"]);
   });
@@ -60,6 +61,26 @@ describe("configuration", () => {
     expect(found.join("\n")).toContain("BANTO_POOLS is required");
     expect(found.join("\n")).toContain("GH_APP_ID is required");
     expect(found.join("\n")).toContain("BANTO_GCS_BUCKET is required");
+  });
+
+  test("accepts disabling scale-down per pool", () => {
+    const pools = JSON.parse(POOLS);
+    pools[0].scaleDown = "disabled";
+    expect(loadConfig({ ...BASE, BANTO_POOLS: JSON.stringify(pools) }).pools[0]?.scaleDown).toBe("disabled");
+  });
+
+  test("requires an explicit opt-in to idle scale-down", () => {
+    const pools = JSON.parse(POOLS);
+    pools[0].scaleDown = "idle";
+    expect(loadConfig({ ...BASE, BANTO_POOLS: JSON.stringify(pools) }).pools[0]?.scaleDown).toBe("idle");
+  });
+
+  test("rejects invalid scale-down policies rather than enabling reductions", () => {
+    for (const value of ["disable", "", true, 0, null]) {
+      const pools = JSON.parse(POOLS);
+      pools[0].scaleDown = value;
+      expect(problems({ ...BASE, BANTO_POOLS: JSON.stringify(pools) }).join()).toContain("scaleDown must be");
+    }
   });
 
   test("rejects BANTO_POOLS that is not JSON", () => {

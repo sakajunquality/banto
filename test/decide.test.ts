@@ -96,10 +96,10 @@ describe("the cooldown anchor", () => {
     expect(decision.cooldownRemainingSeconds).toBe(300);
   });
 
-  test("idle runners still scale down without an anchor, because that is real evidence", () => {
+  test("idle runners cannot bypass a missing cooldown anchor", () => {
     const decision = decide(pool({ cooldownSeconds: 300 }), seen(0, 0, runners(2, 0)), idleSince(null), 2, T0);
-    expect(decision.outcome).toBe("scale_down");
-    expect(decision.idleEvidence).toBe("runners");
+    expect(decision.outcome).toBe("blocked_cooldown");
+    expect(decision.write).toBe(false);
   });
 });
 
@@ -133,10 +133,10 @@ describe("runner evidence", () => {
     expect(decision.outcome).toBe("blocked_runner_busy");
   });
 
-  test("idle runners scale down without waiting for the cooldown", () => {
+  test("idle runners must wait for the cooldown", () => {
     const decision = decide(pool({ cooldownSeconds: 300 }), seen(0, 0, runners(2, 0)), idleSince(T0 - 1_000), 2, T0);
-    expect(decision.outcome).toBe("scale_down");
-    expect(decision.idleEvidence).toBe("runners");
+    expect(decision.outcome).toBe("blocked_cooldown");
+    expect(decision.write).toBe(false);
   });
 
   test("an empty runner list is not evidence of idleness", () => {

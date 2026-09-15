@@ -127,14 +127,18 @@ Honest list. These need other kinds of test, or have none.
 7. **A pool above its own `max`.** The model's external writer is capped at
    `max`, so it never manufactures this state and the property layer says
    nothing about it. The behaviour is asserted directly in `controller.test.ts`
-   instead: the pool is cut back to `max` once nothing is in progress and the
-   runners are idle, and is held above `max` only while a job is running or
-   while runner evidence is missing and the cooldown has yet to elapse.
+   instead: with a positive cooldown the pool retains excess capacity while
+   any queued/running work remains, then waits out the grace period. Partial
+   evidence always prevents lowering. `scaleDown: "disabled"` retains excess
+   capacity regardless of the cooldown (covered in `retirement.test.ts`).
 8. **The scale-down hazard itself.** A runner picking up a job between the
    observation and the PATCH is not a bug the model can distinguish from correct
    behaviour, because it is not a bug — it is the documented limitation. The
    invariants are written to tolerate it, which means they also cannot detect a
-   change that made the window *wider*.
+   change that made the window *wider*. `retirement.test.ts` separately
+   reproduces assignment after confirmation, including a nonzero `min`, and
+   verifies that disabled scale-down never requests a reduction. These tests
+   do not claim to implement or validate a runner admission barrier.
 9. **Rate-limit exhaustion and its knock-on effects.** Failures are injected as
    independent per-call probabilities; a real exhaustion is correlated across
    every call for an hour, and nothing here models that.

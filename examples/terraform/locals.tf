@@ -23,6 +23,7 @@ locals {
       max             = 3
       warmSpare       = 0
       cooldownSeconds = 300
+      scaleDown       = "disabled" # retain capacity until coordinated retirement is available
     },
   ]
 }

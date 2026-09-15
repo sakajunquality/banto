@@ -11,6 +11,11 @@ the whole loop end to end. It is still an example, not a module — read it
 before you apply it, the same way you would read anything else you're about
 to run in your own project.
 
+The example sets `scaleDown: "disabled"`: banto grows capacity for work but
+retains it afterwards, with continuing instance charges. This is also the
+application default. Opting into `"idle"` restores automatic reclamation with
+the [documented job-interruption risk](../../README.md#the-scale-down-hazard).
+
 ## What this creates
 
 | File | Resources |

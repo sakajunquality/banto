@@ -512,7 +512,7 @@ describe("no write lowers a count while a runner for that pool is busy", () => {
   }
 });
 
-describe("the count converges once the world stops changing", () => {
+describe("the count converges once work drains and the world stops changing", () => {
   for (const seed of SEEDS) {
     test(`seed ${seed}`, async () => {
       const { random, world, clock, controllers } = scenario(seed, [POOLS, POOLS]);
@@ -541,6 +541,7 @@ describe("the count converges once the world stops changing", () => {
 
       // The world stops moving and the failures stop: banto must reach the
       // right answer from wherever the chaos left it.
+      world.jobs = []; // Surplus capacity is retained while queued work remains.
       world.partialRate = 0;
       world.jobFailureRate = 0;
       world.runnerFailureRate = 0;

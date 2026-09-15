@@ -329,6 +329,11 @@ function parsePools(raw: string | undefined, problems: string[]): PoolConfig[] {
       }
     }
 
+    const scaleDown = record.scaleDown === undefined ? "disabled" : record.scaleDown;
+    if (scaleDown !== "idle" && scaleDown !== "disabled") {
+      problems.push(`${where}.scaleDown must be "idle" or "disabled"`);
+    }
+
     const pool: PoolConfig = {
       name,
       project,
@@ -339,6 +344,7 @@ function parsePools(raw: string | undefined, problems: string[]): PoolConfig[] {
       max: num("max", 0),
       warmSpare: num("warmSpare", 0),
       cooldownSeconds: num("cooldownSeconds", DEFAULT_COOLDOWN_SECONDS),
+      scaleDown: scaleDown === "idle" ? "idle" : "disabled",
       ...(runnerRepo ? { runnerRepo } : {}),
     };
     if (pool.max < pool.min) problems.push(`${where}.max (${pool.max}) is below min (${pool.min})`);
