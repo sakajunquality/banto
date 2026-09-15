@@ -17,7 +17,7 @@ export type JobStatus = "queued" | "in_progress";
  * What is left cannot be derived from a single listing:
  *
  *  - `lastBusyAt` is the last time this pool had observed work, a busy
- *    runner, or incomplete evidence. The idle
+ *    runner, incomplete evidence, or a reset after startup or a failed pass. The idle
  *    cooldown counts from it, and no API call answers "when was that".
  *  - `shortfallSince` is when instances first outnumbered online runners and
  *    have ever since — a duration across passes, not a fact about one.
@@ -56,6 +56,8 @@ export interface PoolConfig {
    */
   warmSpare: number;
   cooldownSeconds: number;
+  /** Omitted disables reductions. Idle mitigation requires explicit opt-in. */
+  scaleDown?: "idle" | "disabled";
   /**
    * `owner/repo` this pool's runners register to, when that is not
    * `GITHUB_ORG`. GitHub's runner list is scoped to wherever the registration

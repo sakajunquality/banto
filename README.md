@@ -6,6 +6,10 @@ staffed with ephemeral GitHub Actions self-hosted runners. It listens to
 `workflow_job` webhooks, counts the jobs that want each pool, and moves the
 pool's `manualInstanceCount` to match.
 
+Automatic scale-down is disabled by default to protect running jobs. Capacity
+can grow but is retained after work finishes. Opt into `scaleDown: "idle"` only
+if the [documented interruption risk](#the-scale-down-hazard) is acceptable.
+
 It is a single Bun process with one runtime dependency (Hono), deployed as a
 container built with [bunko](https://github.com/sakajunquality/bunko). It must
 run as **exactly one instance** — see
@@ -123,7 +127,19 @@ delay is usually not where the time goes.
 
 ### Scaling down
 
-banto only scales a pool down when **all** of these hold:
+Each pool supports `scaleDown: "disabled"` (the default) or `"idle"`.
+`disabled` prevents banto from requesting any decrease, including from a count
+above `max`, while still allowing scale-up for demand or `min`. Capacity is
+retained and billed until retired through a separate operational procedure.
+Use this when controller-initiated interruption is unacceptable. It cannot
+undo an earlier accepted PATCH or prevent platform failures and external writes.
+
+**Upgrade behavior:** configurations written before this option existed now
+retain capacity. Explicitly set `scaleDown: "idle"` to keep the previous
+mitigation policy. This default changes cost and scale-to-zero behavior, not
+the configured scale-up bounds.
+
+In `idle` mode, banto only scales a pool down when **all** of these hold:
 
 - **The evidence is complete.** A listing that was truncated or could not be
   fetched may not lower a count.
@@ -145,19 +161,29 @@ as **busy just now**, not as busy never. The conservative direction costs one
 cooldown of capacity; the other direction scales a pool away on the strength of
 having no record of it.
 
+A failed pass can also leave an old, readable anchor behind. banto resets it
+on the next successfully recorded observation. Every controller startup does
+the same, because the previous process may have observed work without saving
+it. With a positive cooldown, recovery and restart therefore cost a fresh grace
+period; scale-up is still immediate. These are observation-based mitigations,
+not proof that the pool was continuously idle between polls.
+
 Read the next section before you set `min: 0` on anything that matters.
 
 ## The scale-down hazard
 
 **Reducing a worker pool's instance count can stop an instance that is running a
-job.** Cloud Run decides which instance to stop. It does not know that one of
-them is halfway through a test suite, and there is no drain: no way to say
-"retire this one when it goes idle", no per-instance addressing, nothing to mark
-an instance as ineligible.
+job.** Cloud Run decides which instance to stop. The
+[worker-pool scaling API](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.workerPools#WorkerPoolScaling)
+accepts an aggregate count, with no termination target or runner-drain
+acknowledgement. It cannot express "remove this retired runner and keep that
+busy runner". Cloud Run's separate Instances API is not a retirement selector
+for a worker pool's count update.
 
 What `--ephemeral` does and does not buy you is worth being precise about. It
-guarantees that a runner takes one job and deregisters afterwards, so a killed
-instance leaves no half-configured runner behind to pick up more work. It says
+guarantees that a runner takes one job and deregisters after processing it. It
+does not establish that an unused runner cannot accept its first job during
+scale-down, or that a killed runner's registration immediately disappears. It says
 nothing about how the interrupted job is reported: GitHub notices the runner is
 gone on its own schedule, and the job's failure can take minutes to surface. So
 the job is lost either way — the guarantee is about the *runner*, not about
@@ -174,12 +200,14 @@ a lease while it works, does not survive a scale-down: Cloud Run sends `SIGTERM`
 and follows it with `SIGKILL` about ten seconds later, and an instance being
 removed is removed whatever the process inside it does. Ignoring the signal buys
 ten seconds, not a graceful finish. Coordinating admission with retirement needs a separate design; see
-[the drain protocol investigation](https://github.com/sakajunquality/banto/issues/7).
+[the coordinated-retirement design](docs/runner-retirement.md) for
+[Issue #7](https://github.com/sakajunquality/banto/issues/7).
 Available mitigations include:
 
-- **`min`** — banto never takes a pool below it, so a pipeline that cannot
-  tolerate a killed job should keep its capacity there and pay for it around the
-  clock.
+- **`scaleDown: "disabled"`** — prevents new downward requests by banto while
+  retaining scale-up. This is containment, with a continuing capacity cost.
+- **`min`** — a capacity floor, not protection for any particular instance.
+  A reduction from two to one can still terminate the busy runner.
 - **The runner cross-check** plus the mandatory cooldown and pre-PATCH
   confirmation reduce the opportunity for stopping a newly busy runner.
 - **A generous `cooldownSeconds`** retains capacity between closely spaced jobs.
@@ -195,8 +223,10 @@ Available mitigations include:
   the job it was validating never ran — on a release pipeline that is worse than
   the failure it hides.
 
-If none of that is acceptable for a given workload, that workload wants a pool
-with `min` equal to its peak, and banto should not be scaling it at all.
+If automatic capacity reclamation must also avoid intentionally interrupting
+jobs, use an execution architecture with individual runner lifecycles. The
+[design investigation](docs/runner-retirement.md#alternative-execution-architecture)
+describes that alternative and the requirements for a pool-wide barrier.
 
 ## Reconcile
 
@@ -410,13 +440,13 @@ pass on either side recomputes from GitHub and corrects it. The guarantee is:
 ```json
 {"severity":"INFO","message":"scaling decision","pool":"default","demand":2,"warmSpare":0,"current":1,"desired":2,"target":2,"outcome":"scale_up","wrote":true,"evidence":"complete","running":0}
 {"severity":"INFO","message":"scaling decision","pool":"default","demand":1,"warmSpare":0,"current":2,"desired":1,"target":2,"outcome":"blocked_in_progress","wrote":false,"evidence":"complete","running":1}
-{"severity":"INFO","message":"scaling decision","pool":"build","demand":0,"warmSpare":0,"current":1,"desired":0,"target":0,"outcome":"scale_down","wrote":true,"evidence":"complete","running":0,"runnersOnline":1,"runnersBusy":0,"idleEvidence":"runners"}
+{"severity":"INFO","message":"scaling decision","pool":"build","demand":0,"warmSpare":0,"current":1,"desired":0,"target":0,"outcome":"scale_down","wrote":true,"evidence":"complete","running":0,"runnersOnline":1,"runnersBusy":0,"idleEvidence":"cooldown"}
 {"severity":"INFO","message":"scaling decision","pool":"build","demand":0,"warmSpare":0,"current":1,"desired":0,"target":1,"outcome":"blocked_incomplete_evidence","wrote":false,"evidence":"partial","evidenceReason":"runner listing unavailable"}
 ```
 
 `outcome` is one of `scale_up`, `scale_down`, `unchanged`,
 `blocked_incomplete_evidence`, `blocked_in_progress`, `blocked_runner_busy`,
-`blocked_cooldown`. `idleEvidence` is now `cooldown` for every scale-down;
+`blocked_cooldown`, `blocked_scale_down_disabled`. `idleEvidence` is now `cooldown` for every scale-down;
 older releases also emitted `runners` for the removed idle-runner shortcut.
 
 **A configured pool that never matches a job looks, in the logs, exactly like a
@@ -643,6 +673,7 @@ Each entry of `BANTO_POOLS`:
 | `warmSpare` | no | `0` | Idle instances kept *on top of* current demand |
 | `name` | no | `workerPool` | Logical name; also the storage key, so letters, digits, `.`, `-`, `_` only |
 | `cooldownSeconds` | no | `300` | Required quiet-period grace before every scale-down (0 disables the grace) |
+| `scaleDown` | no | `"disabled"` | Prevents downward requests while allowing scale-up; explicitly select `"idle"` to accept observation-based mitigation and its interruption risk |
 | `runnerRepo` | no | — | `owner/repo` this pool's runners register to; unset means "cross-check against `GITHUB_ORG`" |
 
 **A pool's address must mean exactly what it says.** The three components are

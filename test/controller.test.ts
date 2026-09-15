@@ -697,7 +697,9 @@ describe("scale-down confirmation", () => {
     test(`retains capacity when ${change} appears after the first observation`, async () => {
       const github = new FakeGitHub([], [runner()]);
       const h = harness({ pools: [DEFAULT], github, counts: { default: 2 } });
-      await h.store.put("default", { lastBusyAt: T0 - 600_000 }, null);
+      await h.controller.reconcile();
+      h.clock.advance(600_000);
+      github.calls = 0;
       const put = h.store.put.bind(h.store);
       let writes = 0;
       h.store.put = async (...args) => {
@@ -725,7 +727,10 @@ describe("scale-down confirmation", () => {
   test("confirms a quiet pool twice before lowering it", async () => {
     const github = new FakeGitHub([], [runner()]);
     const h = harness({ pools: [DEFAULT], github, counts: { default: 1 } });
-    await h.store.put("default", { lastBusyAt: T0 - 300_000 }, null);
+    await h.controller.reconcile();
+    h.clock.advance(300_000);
+    github.calls = 0;
+    github.runnerCalls = 0;
     await h.controller.reconcile();
     expect(github.calls).toBe(2);
     expect(github.runnerCalls).toBe(2);
@@ -754,7 +759,8 @@ describe("scale-down confirmation", () => {
 
   test("a failed confirmation state write cannot reach the scaling API", async () => {
     const h = harness({ pools: [DEFAULT], counts: { default: 1 } });
-    await h.store.put("default", { lastBusyAt: T0 - 600_000 }, null);
+    await h.controller.reconcile();
+    h.clock.advance(600_000);
     const put = h.store.put.bind(h.store);
     let writes = 0;
     h.store.put = async (...args) => {
@@ -763,5 +769,70 @@ describe("scale-down confirmation", () => {
     };
     expect((await h.controller.reconcile()).failures).toHaveLength(1);
     expect(h.workerPools.writes).toEqual([]);
+  });
+});
+
+describe("cooldown recovery after a failed pass", () => {
+  for (const failure of ["pool read", "state read", "state write", "scale write"] as const) {
+    test(`${failure} during confirmation cannot preserve an expired anchor`, async () => {
+      const h = harness({ pools: [DEFAULT], counts: { default: 2 } });
+      await h.controller.reconcile();
+      h.clock.advance(600_000);
+      const put = h.store.put.bind(h.store);
+      const get = h.store.get.bind(h.store);
+      let writes = 0;
+      h.store.put = async (...args) => {
+        const result = await put(...args);
+        if (++writes === 1) {
+          // The second observation cannot establish idleness. Losing its
+          // anchor must not turn the next successful listing into permission.
+          if (failure !== "scale write") h.github.jobsComplete = false;
+          if (failure === "pool read") h.workerPools.failNextGet = new Error("unavailable");
+          if (failure === "state read") h.store.get = async () => { throw new Error("unavailable"); };
+          if (failure === "state write") h.store.put = async () => { throw new Error("unavailable"); };
+          if (failure === "scale write") h.workerPools.failNextWrite = new Error("unavailable");
+        }
+        return result;
+      };
+      expect((await h.controller.reconcile()).failures).toHaveLength(1);
+      expect(h.workerPools.writes).toEqual([]);
+      h.store.get = get;
+      h.store.put = put;
+      h.github.jobsComplete = true;
+
+      const recovered = await h.controller.reconcile();
+      expect(recovered.decisions[0]?.outcome).toBe("blocked_cooldown");
+      expect(h.workerPools.countOf("default")).toBe(2);
+      h.clock.advance(299_999);
+      expect((await h.controller.reconcile()).decisions[0]?.outcome).toBe("blocked_cooldown");
+      h.clock.advance(1);
+      expect((await h.controller.reconcile()).decisions[0]?.outcome).toBe("scale_down");
+    });
+  }
+
+  test("a restart cannot recover an expired anchor after an unrecorded busy observation", async () => {
+    const h = harness({ pools: [DEFAULT], counts: { default: 2 } });
+    await h.controller.reconcile();
+    h.clock.advance(600_000);
+    h.github.jobs = jobsFor([1], DEFAULT.labels, "in_progress");
+    h.workerPools.failNextGet = new Error("unavailable");
+    expect((await h.controller.reconcile()).failures).toHaveLength(1);
+    h.github.jobs = [];
+    const restarted = new Controller({
+      pools: [DEFAULT], store: h.store, workerPools: h.workerPools,
+      github: h.github, clock: h.clock, logger: nullLogger, minPassIntervalMs: 0,
+    });
+    expect((await restarted.reconcile()).decisions[0]?.outcome).toBe("blocked_cooldown");
+    h.clock.advance(300_000);
+    expect((await restarted.reconcile()).decisions[0]?.outcome).toBe("scale_down");
+  });
+
+  test("recovery still allows immediate scale-up", async () => {
+    const h = harness({ pools: [DEFAULT] });
+    h.workerPools.failNextGet = new Error("unavailable");
+    expect((await h.controller.reconcile()).failures).toHaveLength(1);
+    h.github.jobs = jobsFor([1, 2, 3], DEFAULT.labels);
+    expect((await h.controller.reconcile()).decisions[0]?.outcome).toBe("scale_up");
+    expect(h.workerPools.countOf("default")).toBe(3);
   });
 });

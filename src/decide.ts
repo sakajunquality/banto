@@ -10,7 +10,7 @@ import type { PoolConfig, PoolEvidence, PoolState, RunnerObservation } from "./t
  * pick which instance to stop, and it may pick one that is in the middle of a
  * job. An ephemeral runner turns that into a failed job rather than a lost one,
  * but a failed job is still a failure someone has to re-run. So banto only
- * scales down when all of:
+ * scales down in `idle` mode when all of:
  *
  *   1. the listing is complete — partial evidence may never lower a count;
  *   2. no job for this pool is running, per that listing;
@@ -26,6 +26,7 @@ export type DecisionOutcome =
   | "blocked_incomplete_evidence"
   | "blocked_in_progress"
   | "blocked_runner_busy"
+  | "blocked_scale_down_disabled"
   | "blocked_cooldown";
 
 export interface Decision {
@@ -100,6 +101,12 @@ export function decide(
     // Raising a count on partial evidence is safe: what banto saw is a lower
     // bound on the work waiting.
     return { ...base, target: desired, outcome: "scale_up", write: true };
+  }
+
+  // Aggregate scaling cannot choose a retired instance or prevent assignment
+  // after the last observation. Operators can disable that write entirely.
+  if (pool.scaleDown !== "idle") {
+    return { ...base, target: current, outcome: "blocked_scale_down_disabled", write: false };
   }
 
   // Below this line the decision would lower the count, so it needs evidence

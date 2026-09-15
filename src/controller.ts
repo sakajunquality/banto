@@ -120,6 +120,8 @@ export class Controller {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly runs = new Map<string, PoolRuns>();
   private readonly lastPassAt = new Map<string, number>();
+  /** Failed writes may leave a valid but obsolete anchor in durable storage. */
+  private readonly needsCooldownReset = new Set<string>();
   /**
    * The last time each pool's own pass saw *any* job attributed to it, kept in
    * memory rather than in `PoolState`. It only ever widens a WARNING window
@@ -139,7 +141,12 @@ export class Controller {
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     // Unknown history reads as "matched just now": a fresh process should not
     // spend its first day's worth of passes accusing every pool of drift.
-    for (const pool of deps.pools) this.lastMatchedAt.set(pool.name, deps.clock.now());
+    for (const pool of deps.pools) {
+      this.lastMatchedAt.set(pool.name, deps.clock.now());
+      // A previous process may have observed work without managing to save it.
+      // Establish a new anchor on the first successfully recorded observation.
+      this.needsCooldownReset.add(pool.name);
+    }
   }
 
   async handleWorkflowJob(event: WorkflowJobEvent): Promise<EventOutcome> {
@@ -247,6 +254,17 @@ export class Controller {
    * trigger that asked for it.
    */
   private async runPass(pool: PoolConfig): Promise<Decision> {
+    try {
+      return await this.observeAndApply(pool);
+    } catch (error) {
+      // Keep the reset pending until storage recovers. This also covers an
+      // ambiguous PATCH failure: elapsed time alone cannot prove it was idle.
+      this.needsCooldownReset.add(pool.name);
+      throw error;
+    }
+  }
+
+  private async observeAndApply(pool: PoolConfig): Promise<Decision> {
     await this.respectPassInterval(pool.name);
     this.lastPassAt.set(pool.name, this.deps.clock.now());
 
@@ -301,7 +319,9 @@ export class Controller {
     // cooldown that never starts.
     // Any observed work or missing evidence restarts the quiet period. Excess
     // capacity is retained while work remains, rather than treating it as idle.
-    const busy = evidence.kind === "partial" || evidence.demand > 0 || (runners?.busy ?? 0) > 0;
+    const busy =
+      this.needsCooldownReset.has(pool.name) ||
+      evidence.kind === "partial" || evidence.demand > 0 || (runners?.busy ?? 0) > 0;
     const state = await mutate(
       this.deps.store,
       pool.name,
@@ -317,6 +337,7 @@ export class Controller {
       }),
       this.deps.retry ?? {},
     );
+    this.needsCooldownReset.delete(pool.name);
 
     return { instanceCount, etag, at, state };
   }

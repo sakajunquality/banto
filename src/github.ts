@@ -309,15 +309,9 @@ export class GitHubAppClient implements GitHubClient {
         // both. Merging them silently sends the busy flag to one pool and lets
         // the other scale down on evidence that was never about it.
         //
-        // `status` belongs with labels, not with `busy`. It looks mergeable,
-        // but the direction is inverted: `online` is the value that *licenses*
-        // an immediate shrink (see `decide`, which skips the cooldown when
-        // runners are online and none are busy), so resolving a disagreement
-        // toward `online` picks the permissive reading, not the safe one.
-        // Preferring `offline` would be conservative for the shrink decision
-        // and would then overstate the staffing shortfall instead. There is no
-        // reading that is right in both directions, so say the listing is
-        // partial and let the cooldown carry it.
+        // Conflicting status readings also show that the listing changed
+        // while it was fetched. Neither reading establishes current staffing;
+        // report partial evidence, which blocks shrinking and resets cooldown.
         if (!sameLabels(existing.labels, runner.labels)) complete = false;
         if (existing.status !== runner.status) complete = false;
         byId.set(runner.id, { ...existing, busy: existing.busy || runner.busy });
