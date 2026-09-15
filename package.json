@@ -1,7 +1,7 @@
 {
   "name": "banto",
   "version": "0.1.0",
-  "description": "Keeps a Cloud Run worker pool staffed with ephemeral GitHub Actions runners, driven by workflow_job webhooks.",
+  "description": "Serverless ephemeral GitHub Actions runners on Cloud Run Jobs or worker pools, driven by workflow_job webhooks.",
   "license": "MIT",
   "type": "module",
   "private": false,

@@ -1,4 +1,5 @@
 import type { WorkerPoolClient } from "./cloudrun.ts";
+import type { ExecutionScaler } from "./executions.ts";
 import { type Decision, decide, SUSTAINED_SHORTFALL_MS, trackStaffing, usableAnchor } from "./decide.ts";
 import type { GitHubClient, RateLimitState } from "./github.ts";
 import type { Logger } from "./log.ts";
@@ -45,6 +46,7 @@ export interface ControllerDeps {
   pools: PoolConfig[];
   store: DemandStore;
   workerPools: WorkerPoolClient;
+  executions?: ExecutionScaler;
   github: GitHubClient;
   clock: Clock;
   logger: Logger;
@@ -269,6 +271,11 @@ export class Controller {
     this.lastPassAt.set(pool.name, this.deps.clock.now());
 
     let evidence = await this.gatherEvidence(pool);
+    if (pool.backend === "jobs") {
+      if (!this.deps.executions) throw new Error("jobs backend is not configured");
+      this.reportPoolMatch(pool, evidence, this.deps.clock.now());
+      return this.deps.executions.reconcile(pool, evidence);
+    }
     let observation = await this.recordObservation(pool, evidence);
     let decision = decide(pool, evidence, observation.state, observation.instanceCount, observation.at);
     if (decision.outcome === "scale_down") {
@@ -326,6 +333,7 @@ export class Controller {
       this.deps.store,
       pool.name,
       (current) => ({
+        ...current,
         // First pass for a pool seeds the anchor with now: an unknown history
         // is treated as "busy just now", so a pool is never scaled away on the
         // strength of having no record. An anchor that cannot be used — absurd,
@@ -378,6 +386,10 @@ export class Controller {
     }
 
     if (!jobsComplete) return { kind: "partial", demand, reason };
+
+    // Jobs capacity comes from execution reservations and terminal platform
+    // state. Stale GitHub registrations must never count as usable capacity.
+    if (pool.backend === "jobs") return { kind: "complete", demand, running, runners: null };
 
     let runners: RunnerObservation | null = null;
     try {

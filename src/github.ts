@@ -2,7 +2,12 @@ import { signJwt } from "./google-auth.ts";
 import { HttpError, httpRequest, parseJson } from "./http.ts";
 import type { Logger } from "./log.ts";
 import { nullLogger } from "./log.ts";
-import type { Fetcher, ObservedJob, ObservedRunner } from "./types.ts";
+import type { Fetcher, ObservedJob, ObservedRunner, PoolConfig } from "./types.ts";
+
+export interface RunnerRegistrar {
+  createJitRunner(pool: PoolConfig, name: string): Promise<{ runnerId: number; config: string }>;
+  removeRunner(pool: PoolConfig, runnerId: number): Promise<void>;
+}
 
 /**
  * GitHub App client for the reconcile path.
@@ -143,7 +148,7 @@ export function isSafeRepoName(name: string): boolean {
   return parts.length === 2 && parts.every((part) => PATH_SEGMENT.test(part));
 }
 
-export class GitHubAppClient implements GitHubClient {
+export class GitHubAppClient implements GitHubClient, RunnerRegistrar {
   private readonly api: string;
   private readonly fetchImpl: Fetcher;
   private readonly now: () => number;
@@ -163,6 +168,42 @@ export class GitHubAppClient implements GitHubClient {
     this.maxPages = options.maxPagesPerQuery ?? 5;
     this.concurrency = options.concurrency ?? 4;
     this.timeoutMs = options.timeoutMs ?? 10_000;
+  }
+
+  async createJitRunner(pool: PoolConfig, name: string): Promise<{ runnerId: number; config: string }> {
+    const what = "GitHub JIT runner registration";
+    const response = await httpRequest(this.fetchImpl, `${this.api}${this.runnerScope(pool)}/generate-jitconfig`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${await this.installationToken()}`, "content-type": "application/json",
+        accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" },
+      body: JSON.stringify({ name, runner_group_id: pool.runnerGroupId ?? 1, labels: pool.labels, work_folder: "_work" }),
+    }, what, this.timeoutMs);
+    this.recordRateLimit(response.headers);
+    if (!response.ok) throw new HttpError(what, response.status);
+    const body = parseJson<{ runner?: { id?: unknown }; encoded_jit_config?: unknown }>(response, what);
+    if (typeof body.runner?.id !== "number" || !Number.isSafeInteger(body.runner.id) || body.runner.id <= 0 ||
+      typeof body.encoded_jit_config !== "string" || !body.encoded_jit_config) {
+      throw new Error(`${what} returned an unreadable configuration`);
+    }
+    return { runnerId: body.runner.id, config: body.encoded_jit_config };
+  }
+
+  async removeRunner(pool: PoolConfig, runnerId: number): Promise<void> {
+    if (!Number.isSafeInteger(runnerId) || runnerId <= 0) throw new Error("invalid runner id");
+    const what = "GitHub retired runner cleanup";
+    const response = await httpRequest(this.fetchImpl, `${this.api}${this.runnerScope(pool)}/${runnerId}`, {
+      method: "DELETE", headers: { authorization: `Bearer ${await this.installationToken()}`,
+        accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" },
+    }, what, this.timeoutMs);
+    this.recordRateLimit(response.headers);
+    if (!response.ok && response.status !== 404) throw new HttpError(what, response.status);
+  }
+
+  private runnerScope(pool: PoolConfig): string {
+    if (pool.runnerRepo && isSafeRepoName(pool.runnerRepo)) return `/repos/${pool.runnerRepo}/actions/runners`;
+    const org = this.options.org;
+    if (pool.runnerRepo || !org || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(org)) throw new Error("invalid JIT registration scope");
+    return `/orgs/${org}/actions/runners`;
   }
 
   async observeJobs(): Promise<Listing<ObservedJob>> {

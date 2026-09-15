@@ -31,6 +31,36 @@ const BASE = {
   BANTO_FIRESTORE_PROJECT: "my-runners-prd",
 };
 
+describe("serverless jobs configuration", () => {
+  function configured(overrides: Record<string, unknown> = {}) {
+    return { ...BASE, BANTO_POOLS: JSON.stringify([{ name: "jobs", backend: "jobs", job: "runner",
+      project: "test-project", location: "us-central1", max: 3, labels: ["self-hosted", "jobs"],
+      runnerRepo: "example-org/infra", ...overrides }]) };
+  }
+  test("accepts a jobs pool without a worker pool and defaults to no warm capacity", () => {
+    const config = loadConfig(configured());
+    expect(config.pools[0]).toMatchObject({ backend: "jobs", job: "runner", min: 0, warmSpare: 0, idleTimeoutSeconds: 120 });
+    expect(config.pools[0]?.workerPool).toBeUndefined();
+  });
+  for (const [overrides, error] of [
+    [{ workerPool: "runner" }, "cannot also set workerPool"],
+    [{ job: "../other" }, "job must be"],
+    [{ min: 1 }, "requires min=0"],
+    [{ warmSpare: 1 }, "requires min=0"],
+    [{ scaleDown: "idle" }, "retire through completion"],
+    [{ idleTimeoutSeconds: 0 }, "idleTimeoutSeconds must be"],
+    [{ runnerGroupId: 0 }, "runnerGroupId must be"],
+  ] as const) {
+    test(`rejects incompatible jobs configuration: ${Object.keys(overrides)[0]}`, () => {
+      expect(problems(configured(overrides)).join()).toContain(error);
+    });
+  }
+  test("requires durable state and a registration scope", () => {
+    expect(problems({ ...configured(), BANTO_STORE: "memory" }).join()).toContain("durable");
+    expect(problems(configured({ runnerRepo: undefined })).join()).toContain("runnerRepo or GITHUB_ORG");
+  });
+});
+
 function problems(env: Record<string, string | undefined>): string[] {
   try {
     loadConfig(env);

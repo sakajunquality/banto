@@ -3,6 +3,7 @@ import { HttpError, httpRequest } from "./http.ts";
 import { ConcurrencyError, type DemandStore, type VersionedState } from "./store.ts";
 import type { Fetcher, PoolState } from "./types.ts";
 import { emptyPoolState } from "./types.ts";
+import { readExecutionState } from "./launch-state.ts";
 
 /**
  * GCS-backed demand state over the JSON API. This is banto's default store.
@@ -159,6 +160,7 @@ export function parseState(body: string, key: string): PoolState {
   return {
     lastBusyAt: asNumber(record.lastBusyAt),
     shortfallSince: asNumber(record.shortfallSince),
+    ...(record.executions === undefined ? {} : { executions: readExecutionState(record.executions) }),
   };
 }
 

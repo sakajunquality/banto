@@ -4,9 +4,11 @@ report.json
 *.log
 .oci-report.json
 
-# Terraform (examples/terraform)
+# Terraform examples
 .terraform/
 *.tfstate
 *.tfstate.*
 .terraform.tfstate.lock.info
 *.tfplan
+*.tfvars
+*.tfvars.json

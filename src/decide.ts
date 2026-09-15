@@ -27,6 +27,8 @@ export type DecisionOutcome =
   | "blocked_in_progress"
   | "blocked_runner_busy"
   | "blocked_scale_down_disabled"
+  | "blocked_launch_backoff"
+  | "awaiting_completion"
   | "blocked_cooldown";
 
 export interface Decision {
