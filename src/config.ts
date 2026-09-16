@@ -140,6 +140,11 @@ export function loadConfig(env: Env = process.env): BantoConfig {
     repos: splitList(env.GITHUB_REPOS),
     org: env.GITHUB_ORG?.trim() ?? "",
   };
+  for (const pool of pools) {
+    if (pool.backend !== "jobs") continue;
+    if (store === "memory") problems.push("jobs pools require a durable GCS or Firestore store");
+    if (!pool.runnerRepo && !github.org) problems.push(`pool ${pool.name}: jobs requires runnerRepo or GITHUB_ORG`);
+  }
   // The same predicate the client uses before putting a name in a URL. Two
   // different rules meant a config could start cleanly and then have that
   // repository silently contribute no demand, because the client refused to
@@ -275,8 +280,14 @@ function parsePools(raw: string | undefined, problems: string[]): PoolConfig[] {
       return value;
     };
 
-    const workerPool = str("workerPool");
-    const name = str("name", workerPool);
+    const backend = record.backend === undefined ? "worker-pool" : record.backend;
+    if (backend !== "worker-pool" && backend !== "jobs") problems.push(`${where}.backend must be "worker-pool" or "jobs"`);
+    const workerPool = backend === "jobs" ? "" : str("workerPool");
+    const job = backend === "jobs" ? str("job") : "";
+    if (job && !RESOURCE_ID.test(job)) problems.push(`${where}.job must be a Cloud Run job short name`);
+    if (backend === "jobs" && record.workerPool !== undefined) problems.push(`${where}: jobs cannot also set workerPool`);
+    if (backend !== "jobs" && record.job !== undefined) problems.push(`${where}: job requires backend=jobs`);
+    const name = str("name", workerPool || job);
     const project = str("project");
     const location = str("location");
 
@@ -338,15 +349,23 @@ function parsePools(raw: string | undefined, problems: string[]): PoolConfig[] {
       name,
       project,
       location,
-      workerPool,
+      ...(backend === "jobs" ? { backend: "jobs" as const, job,
+        runnerGroupId: num("runnerGroupId", 1), idleTimeoutSeconds: num("idleTimeoutSeconds", 120),
+      } : { workerPool }),
       labels: Array.isArray(labels) ? labels.filter((l): l is string => typeof l === "string").map((l) => l.trim()) : [],
       min: num("min", 0),
       max: num("max", 0),
       warmSpare: num("warmSpare", 0),
       cooldownSeconds: num("cooldownSeconds", DEFAULT_COOLDOWN_SECONDS),
-      scaleDown: scaleDown === "idle" ? "idle" : "disabled",
+      ...(backend === "jobs" ? {} : { scaleDown: scaleDown === "idle" ? "idle" as const : "disabled" as const }),
       ...(runnerRepo ? { runnerRepo } : {}),
     };
+    if (backend === "jobs") {
+      if (pool.min !== 0 || pool.warmSpare !== 0) problems.push(`${where}: jobs requires min=0 and warmSpare=0 for scale-to-zero`);
+      if (!pool.runnerGroupId) problems.push(`${where}.runnerGroupId must be positive`);
+      if (!pool.idleTimeoutSeconds || pool.idleTimeoutSeconds > 3600) problems.push(`${where}.idleTimeoutSeconds must be 1-3600`);
+      if (record.scaleDown !== undefined) problems.push(`${where}: jobs retire through completion; scaleDown applies only to worker pools`);
+    }
     if (pool.max < pool.min) problems.push(`${where}.max (${pool.max}) is below min (${pool.min})`);
     if (pool.warmSpare > pool.max) {
       problems.push(`${where}.warmSpare (${pool.warmSpare}) exceeds max (${pool.max}), so the spare can never exist`);

@@ -21,6 +21,8 @@ export type JobStatus = "queued" | "in_progress";
  *    cooldown counts from it, and no API call answers "when was that".
  *  - `shortfallSince` is when instances first outnumbered online runners and
  *    have ever since — a duration across passes, not a fact about one.
+ *  - `executions` owns jobs-backend launch reservations and failure backoff.
+ *    An absent execution listing cannot prove a non-idempotent launch failed.
  *
  * The current instance count is deliberately absent: it is read from Cloud Run
  * in the pass that uses it, which is both fresher and one less thing to keep
@@ -29,6 +31,24 @@ export type JobStatus = "queued" | "in_progress";
 export interface PoolState {
   lastBusyAt?: number | null;
   shortfallSince?: number | null;
+  /** Launch reservations, not a cache of GitHub demand. Jobs backend only. */
+  executions?: ExecutionState;
+}
+
+export interface RunnerLaunch {
+  id: string;
+  createdAt: number;
+  runnerId?: number;
+  /** A definite launch rejection, retained until registration cleanup succeeds. */
+  notSubmitted?: boolean;
+  operation?: string;
+  execution?: string;
+}
+
+export interface ExecutionState {
+  launches: RunnerLaunch[];
+  failures: number;
+  retryAfter: number;
 }
 
 export function emptyPoolState(): PoolState {
@@ -38,12 +58,17 @@ export function emptyPoolState(): PoolState {
 export interface PoolConfig {
   /** Logical name used in logs and as the store key. */
   name: string;
-  /** GCP project holding the worker pool. */
+  /** GCP project holding the execution resource. */
   project: string;
-  /** Worker pool region, e.g. `asia-northeast1`. */
+  /** Cloud Run region, e.g. `asia-northeast1`. */
   location: string;
   /** Cloud Run worker pool short name (not the fully qualified resource name). */
-  workerPool: string;
+  workerPool?: string;
+  /** Jobs run one ephemeral runner per execution and retire through completion. */
+  backend?: "worker-pool" | "jobs";
+  job?: string;
+  runnerGroupId?: number;
+  idleTimeoutSeconds?: number;
   /** Label selector: every label here must appear on a job for it to match. */
   labels: string[];
   min: number;
@@ -80,7 +105,7 @@ export interface PoolConfig {
  * compare as different targets scale one worker pool against each other.
  */
 export function poolResourceName(pool: PoolConfig): string {
-  return `projects/${pool.project}/locations/${pool.location}/workerPools/${pool.workerPool}`;
+  return `projects/${pool.project}/locations/${pool.location}/${pool.backend === "jobs" ? `jobs/${pool.job}` : `workerPools/${pool.workerPool}`}`;
 }
 
 /**
@@ -93,7 +118,7 @@ export function poolResourceName(pool: PoolConfig): string {
  * refuses the numeric form rather than pretending the comparison covers it.
  */
 export function poolTarget(pool: PoolConfig): string {
-  return `${pool.project}/${pool.location}/${pool.workerPool}`;
+  return poolResourceName(pool);
 }
 
 /** Injected so tests never touch the real clock. */

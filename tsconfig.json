@@ -16,5 +16,5 @@
     "noImplicitOverride": true,
     "exactOptionalPropertyTypes": true
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "runner"]
 }
