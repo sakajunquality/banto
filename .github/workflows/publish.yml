@@ -49,13 +49,13 @@ jobs:
       # the Action ref when that ref looks like a version, and otherwise from the
       # checkout the ref names — so a commit pin fixes the CLI too, not just the
       # Action.
-      - uses: sakajunquality/bunko@58ad5f2527820727f4365a12bdb4553f74618e28 # v0.7.0
+      - uses: sakajunquality/bunko@ddee9a0d5eb0e2c26ea61ecab32fdd9adbb1f5e8 # v0.8.3
         with:
           # Same reason as ci.yml: keep in step with `packageManager`.
           bun-version: 1.4.2
 
       - id: build
-        uses: sakajunquality/bunko/build@58ad5f2527820727f4365a12bdb4553f74618e28 # v0.7.0
+        uses: sakajunquality/bunko/build@ddee9a0d5eb0e2c26ea61ecab32fdd9adbb1f5e8 # v0.8.3
         with:
           # bunko appends `bunko.imageName` from package.json, so this publishes
           # ghcr.io/sakajunquality/banto.
