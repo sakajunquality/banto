@@ -4,6 +4,7 @@ import { poolTarget } from "./types.ts";
 import { DEFAULT_GCS_PREFIX } from "./gcs.ts";
 import type { Severity } from "./log.ts";
 import type { PoolConfig } from "./types.ts";
+import type { GstsOptions } from "./gsts.ts";
 
 /**
  * Configuration is read from the environment once, at startup, and validated
@@ -25,6 +26,7 @@ export interface BantoConfig {
     appId: string;
     installationId: string;
     privateKey: string;
+    gsts?: GstsOptions;
     repos: string[];
     /** Org whose runner registrations the reconcile cross-checks. */
     org: string;
@@ -122,7 +124,24 @@ export function loadConfig(env: Env = process.env): BantoConfig {
   if (installationId && !/^\d+$/.test(installationId)) {
     problems.push(`GH_APP_INSTALLATION_ID must be numeric, got "${installationId}"`);
   }
-  const privateKey = normalisePem(required("GH_APP_PRIVATE_KEY"));
+  const useGsts = ["GSTS_URL", "GSTS_AUDIENCE", "GSTS_SCOPE", "GSTS_IDENTITY"].some((key) => !!env[key]?.trim());
+  let gsts: GstsOptions | undefined;
+  if (useGsts) {
+    gsts = { url: required("GSTS_URL"), audience: required("GSTS_AUDIENCE"),
+      scope: required("GSTS_SCOPE"), identity: required("GSTS_IDENTITY") };
+    for (const [key, value] of [["GSTS_URL", gsts.url], ["GSTS_AUDIENCE", gsts.audience]]) {
+      try {
+        const parsed = new URL(value!);
+        if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error();
+      } catch { problems.push(`${key} must be an HTTPS URL without credentials, query or fragment`); }
+    }
+    if (!/^[A-Za-z0-9-]+(?:\/[A-Za-z0-9_.-]+)?$/.test(gsts.scope) || gsts.scope.split("/").some((part) => part === "." || part === "..")) {
+      problems.push("GSTS_SCOPE must be an organization or owner/repository");
+    }
+    if (!/^[A-Za-z0-9_-]+$/.test(gsts.identity)) problems.push("GSTS_IDENTITY must be a policy name without path separators");
+    if (env.GH_APP_PRIVATE_KEY?.trim()) problems.push("GSTS and GH_APP_PRIVATE_KEY cannot be combined");
+  }
+  const privateKey = useGsts ? "" : normalisePem(required("GH_APP_PRIVATE_KEY"));
   // Load the key here rather than discovering at the first reconcile that the
   // secret holds a placeholder or a truncated paste. Nothing about the key is
   // logged: only whether node could read it.
@@ -134,9 +153,10 @@ export function loadConfig(env: Env = process.env): BantoConfig {
     }
   }
   const github = {
-    appId: required("GH_APP_ID"),
+    appId: useGsts ? "" : required("GH_APP_ID"),
     installationId,
     privateKey,
+    ...(gsts ? { gsts } : {}),
     repos: splitList(env.GITHUB_REPOS),
     org: env.GITHUB_ORG?.trim() ?? "",
   };

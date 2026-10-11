@@ -7,6 +7,7 @@ import { FirestoreDemandStore } from "./firestore.ts";
 import { GcsDemandStore } from "./gcs.ts";
 import { GitHubAppClient } from "./github.ts";
 import { AdcTokenSource } from "./google-auth.ts";
+import { GstsTokenSource } from "./gsts.ts";
 import { createLogger } from "./log.ts";
 import { GoogleIdTokenVerifier } from "./oidc.ts";
 import { createApp } from "./server.ts";
@@ -58,6 +59,7 @@ const github = new GitHubAppClient({
   appId: config.github.appId,
   installationId: config.github.installationId,
   privateKey: config.github.privateKey,
+  ...(config.github.gsts ? { tokenSource: new GstsTokenSource(config.github.gsts) } : {}),
   repos: config.github.repos,
   org: config.github.org,
   maxPagesPerQuery: config.maxPagesPerQuery,
