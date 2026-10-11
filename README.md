@@ -694,9 +694,13 @@ Those surface on first use.
 | --- | --- | --- | --- |
 | `BANTO_POOLS` | yes | — | JSON array of pool objects, see below |
 | `GITHUB_WEBHOOK_SECRET` | yes | — | Shared secret configured on the GitHub App webhook |
-| `GH_APP_ID` | yes | — | GitHub App ID |
+| `GH_APP_ID` | PEM mode | — | GitHub App ID |
 | `GH_APP_INSTALLATION_ID` | yes | — | Installation ID; events from other installations are rejected |
-| `GH_APP_PRIVATE_KEY` | yes | — | PEM private key; `\n` escapes are accepted |
+| `GH_APP_PRIVATE_KEY` | PEM mode | — | PEM private key; `\n` escapes are accepted |
+| `GSTS_URL` | gsts mode | — | HTTPS token service endpoint |
+| `GSTS_AUDIENCE` | gsts mode | — | Audience accepted by the gsts trust policy |
+| `GSTS_SCOPE` | gsts mode | — | Organization or owner/repository policy scope |
+| `GSTS_IDENTITY` | gsts mode | — | Default-branch gsts policy name |
 | `GITHUB_REPOS` | no | installation's repos | Comma-separated `owner/repo` list: reconcile scope *and* webhook allowlist |
 | `GITHUB_ORG` | no | — | Org whose runner registrations the reconcile cross-checks, for pools without their own `runnerRepo` |
 | `BANTO_STORE` | no | `gcs` | `gcs`, `firestore` or `memory` |
@@ -710,6 +714,9 @@ Those surface on first use.
 | `BANTO_MIN_PASS_INTERVAL_SECONDS` | no | `10` | Floor between passes for one pool; bounds the GitHub API spend |
 | `PORT` | no | `8080` | HTTP port |
 | `LOG_LEVEL` | no | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+For experimental controller setup without an App key, see [gsts authentication](docs/gsts.md).
+gsts is unreleased and requires a separately deployed compatible endpoint.
 
 Each entry of `BANTO_POOLS`:
 

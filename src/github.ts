@@ -1,4 +1,5 @@
 import { signJwt } from "./google-auth.ts";
+import type { InstallationTokenSource } from "./gsts.ts";
 import { HttpError, httpRequest, parseJson } from "./http.ts";
 import type { Logger } from "./log.ts";
 import { nullLogger } from "./log.ts";
@@ -77,9 +78,10 @@ export interface GitHubClient {
 }
 
 export interface GitHubAppOptions {
-  appId: string;
+  appId?: string;
   installationId: string;
-  privateKey: string;
+  privateKey?: string;
+  tokenSource?: InstallationTokenSource;
   /** Explicit `owner/repo` list. Empty means "ask the installation". */
   repos?: string[];
   /**
@@ -580,6 +582,8 @@ export class GitHubAppClient implements GitHubClient, RunnerRegistrar {
   }
 
   private async mintInstallationToken(): Promise<InstallationToken> {
+    if (this.options.tokenSource) return this.options.tokenSource.mint();
+    if (!this.options.appId || !this.options.privateKey) throw new Error("GitHub credential source is missing");
     const issuedAt = Math.floor(this.now() / 1000);
     const jwt = signJwt(
       { alg: "RS256", typ: "JWT" },
