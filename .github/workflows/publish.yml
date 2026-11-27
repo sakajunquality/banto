@@ -39,7 +39,7 @@ jobs:
       # The first successful publish creates the package private, and GITHUB_TOKEN
       # cannot change that; making ghcr.io/sakajunquality/banto public is a
       # one-time manual step in the package settings.
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -49,13 +49,13 @@ jobs:
       # the Action ref when that ref looks like a version, and otherwise from the
       # checkout the ref names — so a commit pin fixes the CLI too, not just the
       # Action.
-      - uses: sakajunquality/bunko@2ed0b81b03bfcc960631dc83c8fa6c324e68dd9a # v0.12.5
+      - uses: sakajunquality/bunko@70a297ee3f5f1ca0971c5703c6fde26648fc98c0 # v0.12.6
         with:
           # Same reason as ci.yml: keep in step with `packageManager`.
           bun-version: 1.4.2
 
       - id: build
-        uses: sakajunquality/bunko/build@2ed0b81b03bfcc960631dc83c8fa6c324e68dd9a # v0.12.5
+        uses: sakajunquality/bunko/build@70a297ee3f5f1ca0971c5703c6fde26648fc98c0 # v0.12.6
         with:
           # bunko appends `bunko.imageName` from package.json, so this publishes
           # ghcr.io/sakajunquality/banto.
